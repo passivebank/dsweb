@@ -98,10 +98,10 @@ export default function PrivacyPage() {
             For questions regarding this privacy policy or to request deletion of
             your personal data, contact us at{" "}
             <a
-              href="mailto:ben@domainsnobs.com"
+              href="mailto:acquisitions@domainsnobs.com"
               className="text-charcoal font-medium hover:text-gold transition-colors"
             >
-              ben@domainsnobs.com
+              acquisitions@domainsnobs.com
             </a>
             .
           </p>

@@ -31,17 +31,17 @@ function ContactContent() {
             <div>
               <h3 className="font-medium text-charcoal mb-1">Email</h3>
               <a
-                href="mailto:ben@domainsnobs.com"
+                href="mailto:acquisitions@domainsnobs.com"
                 className="text-muted hover:text-charcoal transition-colors"
               >
-                ben@domainsnobs.com
+                acquisitions@domainsnobs.com
               </a>
             </div>
 
             <div>
               <h3 className="font-medium text-charcoal mb-1">Location</h3>
               <p className="text-muted">
-                Roswell, GA — Operating across North American and European
+                Atlanta, GA — Operating across North American and European
                 domain markets
               </p>
             </div>

@@ -17,7 +17,7 @@ export default function Footer() {
         <div className="flex flex-col md:flex-row items-center justify-between gap-8">
           {/* Left: Copyright */}
           <p className="text-sm text-gray-400">
-            &copy; 2025 DomainSnobs LLC. All rights reserved.
+            &copy; 2026 DomainSnobs LLC. All rights reserved.
           </p>
 
           {/* Center: Nav Links */}
@@ -35,16 +35,16 @@ export default function Footer() {
 
           {/* Right: Email */}
           <a
-            href="mailto:ben@domainsnobs.com"
+            href="mailto:acquisitions@domainsnobs.com"
             className="text-sm text-gray-400 hover:text-white transition-colors"
           >
-            ben@domainsnobs.com
+            acquisitions@domainsnobs.com
           </a>
         </div>
 
         {/* Bottom line */}
         <div className="mt-8 pt-6 border-t border-gray-700 text-center">
-          <p className="text-xs text-gray-500">Roswell, GA</p>
+          <p className="text-xs text-gray-500">Atlanta, GA</p>
         </div>
       </div>
     </footer>

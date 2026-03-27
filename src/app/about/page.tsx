@@ -48,11 +48,10 @@ export default function AboutPage() {
           </p>
 
           <p className="text-slate text-base leading-relaxed mb-12">
-            The firm is led by Ben Kramer, a domain investor and infrastructure
-            specialist with a background in digital media, SEO, and web
-            technology. Ben has been active in the domain aftermarket since 2016,
-            building acquisition systems that identify undervalued domain equity
-            before it reaches the open market.
+            Our team brings deep experience in domain investment, digital media,
+            SEO, and web infrastructure. We have been active in the domain
+            aftermarket since 2016, building acquisition systems that identify
+            undervalued domain equity before it reaches the open market.
           </p>
 
           <h2 className="text-2xl font-semibold text-charcoal mb-4">

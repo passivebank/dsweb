@@ -22,7 +22,7 @@ export default function TermsPage() {
       <section className="bg-surface py-16 md:py-24">
         <div className="max-w-3xl mx-auto px-6 prose-custom">
           <p className="text-muted text-sm mb-12">
-            Effective date: January 1, 2025
+            Effective date: January 1, 2026
           </p>
 
           <h2 className="text-xl font-semibold text-charcoal mb-3">
@@ -110,10 +110,10 @@ export default function TermsPage() {
           <p className="text-slate text-base leading-relaxed">
             For questions regarding these terms, contact DomainSnobs LLC at{" "}
             <a
-              href="mailto:ben@domainsnobs.com"
+              href="mailto:acquisitions@domainsnobs.com"
               className="text-charcoal font-medium hover:text-gold transition-colors"
             >
-              ben@domainsnobs.com
+              acquisitions@domainsnobs.com
             </a>
             .
           </p>
