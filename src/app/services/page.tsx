@@ -9,24 +9,28 @@ export const metadata: Metadata = {
 
 const services = [
   {
-    icon: "\u25C8",
+    number: "01",
     headline: "Domain Acquisition",
-    body: "We source expiring, dropped, and off-market domains using proprietary scoring and monitoring infrastructure. Our multi-registrar submission architecture operates across seven acquisition channels with sub-second execution. Domains are evaluated on estimated traffic value, backlink authority, keyword equity, and commercial intent before any capital is deployed.",
+    tagline: "We get there first.",
+    body: "We source expiring, dropped, and off-market domains using proprietary scoring and monitoring infrastructure. Our multi-registrar submission architecture operates across seven acquisition channels with sub-second execution. Domains are evaluated on estimated traffic value, backlink authority, keyword equity, and commercial intent before any capital is deployed. If it doesn't meet the threshold, we don't touch it.",
   },
   {
-    icon: "\u2194",
+    number: "02",
     headline: "Domain Brokerage",
-    body: "Confidential buy-side and sell-side representation for premium domain transactions. We handle outreach, negotiation, and settlement. All brokered transactions settle through Escrow.com with standard ICANN transfer protocols. Our client list includes funded startups, public companies, and private equity portfolio brands.",
+    tagline: "Your name. Our network.",
+    body: "Confidential buy-side and sell-side representation for premium domain transactions. We handle outreach, negotiation, and settlement. All brokered transactions settle through Escrow.com with standard ICANN transfer protocols. Our client list includes funded startups, public companies, and private equity portfolio brands. Discretion is default.",
   },
   {
-    icon: "\u25A3",
+    number: "03",
     headline: "Portfolio Consulting",
-    body: "Domain strategy advisory for investors and holding companies managing 50+ domain portfolios. Services include portfolio valuation using comparable sales data, renewal optimization, acquisition pipeline design, and marketplace positioning across Afternic, Sedo, and Dan.com.",
+    tagline: "Data over intuition. Always.",
+    body: "Domain strategy advisory for investors and holding companies managing 50+ domain portfolios. Services include portfolio valuation using comparable sales data, renewal optimization, acquisition pipeline design, and marketplace positioning across Afternic, Sedo, and Dan.com. We tell you what to drop, what to hold, and what to double down on.",
   },
   {
-    icon: "\u2261",
+    number: "04",
     headline: "Domain Valuation",
-    body: "Independent domain appraisal using a multi-signal scoring model. We evaluate estimated traffic value, backlink equity profile, keyword commercial intent, comparable sales history, and brandability metrics. Reports include acquisition price range, estimated resale ceiling, and recommended hold strategy.",
+    tagline: "What it's actually worth.",
+    body: "Independent domain appraisal using a multi-signal scoring model. We evaluate estimated traffic value, backlink equity profile, keyword commercial intent, comparable sales history, and brandability metrics. Reports include acquisition price range, estimated resale ceiling, and recommended hold strategy. No inflated numbers, no wishful thinking.",
   },
 ];
 
@@ -34,11 +38,17 @@ export default function ServicesPage() {
   return (
     <>
       {/* Hero */}
-      <section className="bg-charcoal text-white py-20">
+      <section className="bg-charcoal text-white py-24">
         <div className="max-w-7xl mx-auto px-6">
-          <h1 className="text-4xl font-bold tracking-tight">Services</h1>
-          <p className="mt-4 text-lg text-gray-400 max-w-2xl">
-            Infrastructure-grade domain services for investors, brands, and holding companies.
+          <p className="text-gold text-sm font-medium tracking-[0.2em] uppercase mb-4">
+            Services
+          </p>
+          <h1 className="text-4xl md:text-5xl font-bold tracking-tight max-w-3xl">
+            Premium service for premium assets.
+          </h1>
+          <p className="mt-6 text-lg text-gray-400 max-w-2xl">
+            Infrastructure-grade domain services for investors, brands, and holding companies
+            that take their namespace seriously.
           </p>
         </div>
       </section>
@@ -51,9 +61,11 @@ export default function ServicesPage() {
         >
           <div className="max-w-7xl mx-auto px-6 py-20">
             <div className="flex flex-col md:flex-row items-start gap-10">
-              {/* Icon */}
-              <div className="flex-shrink-0 w-14 h-14 rounded-lg bg-gold/10 text-gold flex items-center justify-center text-2xl font-bold">
-                {service.icon}
+              {/* Number */}
+              <div className="flex-shrink-0">
+                <span className="text-5xl font-bold text-gold/20">
+                  {service.number}
+                </span>
               </div>
 
               {/* Content */}
@@ -61,6 +73,9 @@ export default function ServicesPage() {
                 <h2 className="text-2xl font-bold text-charcoal">
                   {service.headline}
                 </h2>
+                <p className="mt-1 text-gold text-sm font-medium">
+                  {service.tagline}
+                </p>
                 <p className="mt-4 text-slate leading-relaxed max-w-3xl">
                   {service.body}
                 </p>
@@ -68,7 +83,7 @@ export default function ServicesPage() {
                   href="/contact"
                   className="inline-block mt-6 text-sm font-medium text-gold hover:text-gold-dark transition-colors"
                 >
-                  Get Started &rarr;
+                  Inquire &rarr;
                 </Link>
               </div>
             </div>
@@ -77,16 +92,19 @@ export default function ServicesPage() {
       ))}
 
       {/* Bottom CTA */}
-      <section className="bg-charcoal text-white py-20">
+      <section className="bg-charcoal text-white py-24">
         <div className="max-w-7xl mx-auto px-6 text-center">
-          <h2 className="text-3xl font-bold tracking-tight">
-            Ready to discuss your domain strategy?
+          <p className="text-gold text-sm font-medium tracking-[0.2em] uppercase mb-4">
+            Ready?
+          </p>
+          <h2 className="text-3xl font-bold tracking-tight max-w-2xl mx-auto">
+            If you&apos;re serious about domains, we should talk.
           </h2>
           <Link
             href="/contact"
-            className="inline-block mt-8 bg-gold text-charcoal text-sm font-medium px-8 py-3 rounded hover:opacity-90 transition-opacity"
+            className="inline-block mt-10 bg-gold text-charcoal text-sm font-semibold px-8 py-3.5 rounded hover:bg-gold-light transition-colors tracking-wide"
           >
-            Contact Us
+            Start a Conversation
           </Link>
         </div>
       </section>

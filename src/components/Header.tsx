@@ -16,11 +16,13 @@ export default function Header() {
 
   return (
     <>
-      <header className="fixed top-0 left-0 right-0 z-50 bg-surface border-b border-border">
+      <header className="fixed top-0 left-0 right-0 z-50 bg-surface/95 backdrop-blur-sm border-b border-border">
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           {/* Logo */}
-          <Link href="/" className="text-charcoal font-bold text-xl tracking-tight">
-            DomainSnobs
+          <Link href="/" className="flex items-center gap-2 group">
+            <span className="text-charcoal font-bold text-xl tracking-tight">
+              Domain<span className="text-gold">Snobs</span>
+            </span>
           </Link>
 
           {/* Desktop Nav */}
@@ -36,7 +38,7 @@ export default function Header() {
             ))}
             <Link
               href="/contact"
-              className="bg-gold text-charcoal text-sm font-medium px-5 py-2 rounded hover:opacity-90 transition-opacity"
+              className="bg-charcoal text-white text-sm font-medium px-5 py-2 rounded hover:bg-charcoal-light transition-colors"
             >
               Inquire
             </Link>
@@ -81,7 +83,7 @@ export default function Header() {
             ))}
             <Link
               href="/contact"
-              className="inline-block mt-3 bg-gold text-charcoal text-sm font-medium px-5 py-2 rounded hover:opacity-90 transition-opacity"
+              className="inline-block mt-3 bg-charcoal text-white text-sm font-medium px-5 py-2 rounded hover:bg-charcoal-light transition-colors"
               onClick={() => setMobileOpen(false)}
             >
               Inquire

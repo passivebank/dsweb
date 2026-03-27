@@ -17,11 +17,17 @@ export default function PortfolioPage() {
   return (
     <>
       {/* Hero */}
-      <section className="bg-charcoal text-white py-20">
+      <section className="bg-charcoal text-white py-24">
         <div className="max-w-7xl mx-auto px-6">
-          <h1 className="text-4xl font-bold tracking-tight">Domain Portfolio</h1>
-          <p className="mt-4 text-lg text-gray-400 max-w-2xl">
-            Select domains currently available for acquisition. Inquire for pricing on unlisted inventory.
+          <p className="text-gold text-sm font-medium tracking-[0.2em] uppercase mb-4">
+            Portfolio
+          </p>
+          <h1 className="text-4xl md:text-5xl font-bold tracking-tight max-w-3xl">
+            Every domain earned its place here.
+          </h1>
+          <p className="mt-6 text-lg text-gray-400 max-w-2xl">
+            Select inventory currently available for acquisition.
+            Inquire for pricing on unlisted assets.
           </p>
         </div>
       </section>
@@ -83,7 +89,7 @@ export default function PortfolioPage() {
               {filtered.map((domain) => (
                 <div
                   key={domain.name}
-                  className="bg-surface rounded-lg border border-border p-6 shadow-sm hover:shadow-md transition-shadow"
+                  className="bg-surface rounded-lg border border-border p-6 hover:border-gold/60 hover:shadow-lg transition-all group"
                 >
                   {/* Domain Name */}
                   <h2 className="text-xl font-bold text-charcoal leading-tight">
@@ -92,23 +98,23 @@ export default function PortfolioPage() {
 
                   {/* Badges */}
                   <div className="flex items-center gap-2 mt-3">
-                    <span className="text-xs font-medium bg-gold text-charcoal px-2.5 py-0.5 rounded-full">
+                    <span className="text-[10px] font-semibold tracking-wider uppercase bg-charcoal text-white px-2 py-0.5 rounded">
                       {domain.tld}
                     </span>
-                    <span className="text-xs font-medium bg-charcoal text-white px-2.5 py-0.5 rounded-full">
+                    <span className="text-[10px] font-semibold tracking-wider uppercase text-muted border border-border px-2 py-0.5 rounded">
                       {domain.category}
                     </span>
                   </div>
 
                   {/* Price */}
-                  <p className="text-2xl font-bold text-gold mt-5">{domain.price}</p>
+                  <p className="text-2xl font-bold text-charcoal mt-5">{domain.price}</p>
 
                   {/* CTA */}
                   <Link
                     href={`/contact?domain=${encodeURIComponent(domain.name)}`}
-                    className="inline-block mt-5 bg-gold text-charcoal text-sm font-medium px-6 py-2.5 rounded hover:opacity-90 transition-opacity"
+                    className="inline-block mt-5 text-sm font-medium text-gold hover:text-gold-dark transition-colors"
                   >
-                    Make Offer
+                    Make an offer &rarr;
                   </Link>
                 </div>
               ))}
