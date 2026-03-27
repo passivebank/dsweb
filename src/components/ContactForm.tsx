@@ -15,6 +15,8 @@ const subjects = [
 
 export default function ContactForm({ prefillDomain }: ContactFormProps) {
   const [submitted, setSubmitted] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [subject, setSubject] = useState(prefillDomain ? "Buy a Domain" : "General");
@@ -29,9 +31,29 @@ export default function ContactForm({ prefillDomain }: ContactFormProps) {
     }
   }, [prefillDomain]);
 
-  function handleSubmit(e: FormEvent) {
+  async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    setSubmitted(true);
+    setSending(true);
+    setError("");
+
+    try {
+      const res = await fetch("/api/contact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, email, subject, message }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "Failed to send message.");
+      }
+
+      setSubmitted(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to send message. Please try again.");
+    } finally {
+      setSending(false);
+    }
   }
 
   if (submitted) {
@@ -121,12 +143,18 @@ export default function ContactForm({ prefillDomain }: ContactFormProps) {
           />
         </div>
 
+        {/* Error */}
+        {error && (
+          <p className="text-red-600 text-sm">{error}</p>
+        )}
+
         {/* Submit */}
         <button
           type="submit"
-          className="w-full bg-gold text-charcoal font-medium text-sm px-6 py-3 rounded hover:opacity-90 transition-opacity"
+          disabled={sending}
+          className="w-full bg-gold text-charcoal font-medium text-sm px-6 py-3 rounded hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          Send Message
+          {sending ? "Sending..." : "Send Message"}
         </button>
       </div>
     </form>
