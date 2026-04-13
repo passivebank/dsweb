@@ -456,14 +456,16 @@ class Recorder:
                 ask_f = float(ask)
             except Exception:
                 return
-            # Capture 24h open from ticker to compute ret_24h for signal features
+            # Capture 24h open from ticker — feed both local cache and engine
             open_24h = msg.get("open_24h")
             if open_24h:
                 try:
                     open_f = float(open_24h)
                     if open_f > 0:
                         coin_key = prod.split("-USD")[0]
-                        self._ret_24h[coin_key] = ((bid_f + ask_f) / 2.0) / open_f - 1.0
+                        ret = ((bid_f + ask_f) / 2.0) / open_f - 1.0
+                        self._ret_24h[coin_key] = ret
+                        self.engine.update_ret_24h(coin_key, ret)
                 except Exception:
                     pass
             rec = {

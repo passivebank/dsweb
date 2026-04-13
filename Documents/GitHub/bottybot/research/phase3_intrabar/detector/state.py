@@ -43,9 +43,10 @@ class MidPoint:
 @dataclass
 class CoinState:
     coin: str
-    # Trade window — capacity in seconds
+    # Trade window — capacity in seconds.
+    # mid_window_s extended to 1800 so R5/R7 can compute 15-min returns.
     trade_window_s: int = 600
-    mid_window_s: int = 300
+    mid_window_s: int = 1800
 
     trades: Deque[TradePoint] = field(default_factory=deque)
     mids: Deque[MidPoint] = field(default_factory=deque)
@@ -169,6 +170,19 @@ class CoinState:
     def is_monotone_up(self, now_ns: int, lookback_s: int, max_drawdown_pct: float) -> bool:
         """True if max_pullback_over(lookback_s) <= max_drawdown_pct."""
         return self.max_pullback_over(now_ns, lookback_s) <= max_drawdown_pct
+
+    def dv_trend(self, now_ns: int, window_s: int = 60) -> float:
+        """Dollar-volume in last window_s / dollar-volume in prior window_s.
+
+        > 1.0 = volume accelerating (good).
+        < 1.0 = volume fading (run may be ending).
+        Returns 1.0 if prior window has no data (neutral, not a blocker).
+        """
+        dv_now  = self.dollar_volume_in(now_ns, window_s)
+        dv_prev = self.dollar_volume_in(now_ns, window_s * 2) - dv_now
+        if dv_prev <= 0:
+            return 1.0
+        return dv_now / dv_prev
 
     def cvd_in(self, now_ns: int, lookback_s: int) -> float:
         """Cumulative volume delta: (buy_usd - sell_usd) in the lookback window.

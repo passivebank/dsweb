@@ -38,6 +38,9 @@ from .currently_ripping import (
     check_r2_rank_takeover,
     check_r3_dv_explosion,
     check_r4_post_run_hold,
+    check_r5_confirmed_run,
+    check_r6_local_breakout,
+    check_r7_staircase,
     R4_MIN_SECS_AFTER_RUN,
     R4_MAX_SECS_AFTER_RUN,
 )
@@ -77,9 +80,20 @@ class DetectorEngine:
         # signal de-dup: minimum spacing per (variant, coin)
         self._last_signal_ts_ns: dict[tuple[str, str], int] = {}
         self.SIGNAL_COOLDOWN_S = 60
-        self.R4_COOLDOWN_S = 1800   # 30-min cooldown on R4 per coin
+        self.R4_COOLDOWN_S = 1800    # 30-min cooldown on R4 per coin
+        self.R5_COOLDOWN_S = 600     # 10-min cooldown — confirmed run can persist
+        self.R6_COOLDOWN_S = 300     # 5-min cooldown — breakouts can repeat
+        self.R7_COOLDOWN_S = 300     # 5-min cooldown
         # per-coin signal history (any variant) — 24h rolling, for context features
         self._coin_signal_history: dict[str, deque] = defaultdict(deque)
+        # 24h return per coin — fed from ticker open_24h via update_ret_24h()
+        self._ret_24h: dict[str, float] = {}
+
+    # ----- external feed-ins ----------------------------------
+
+    def update_ret_24h(self, coin: str, ret: float) -> None:
+        """Called by the recorder whenever a ticker message carries open_24h."""
+        self._ret_24h[coin] = ret
 
     # ----- event ingestion ------------------------------------
 
@@ -196,6 +210,28 @@ class DetectorEngine:
                     sig = fn(st, now_ns, rank, self._prev_min_rank(coin, now_ns), spread)
                 else:
                     sig = fn(st, now_ns, rank, spread)
+                if sig is not None:
+                    self._last_signal_ts_ns[sig_key] = now_ns
+                    self._register_run(coin, now_ns, st.last_mid)
+                    self._record_signal_history(coin, now_ns)
+                    if self.on_signal is not None:
+                        self.on_signal(sig)
+                    if self.verbose:
+                        print(f"[SIGNAL] {sig.variant} {coin} feats={sig.features}")
+
+        # R5 / R6 / R7 — confirmation signals; require rank AND ret_24h
+        ret_24h = self._ret_24h.get(coin)
+        if rank is not None and ret_24h is not None:
+            for fn, key, cooldown in (
+                (check_r5_confirmed_run, "R5_CONFIRMED_RUN",  self.R5_COOLDOWN_S),
+                (check_r6_local_breakout,"R6_LOCAL_BREAKOUT", self.R6_COOLDOWN_S),
+                (check_r7_staircase,     "R7_STAIRCASE",      self.R7_COOLDOWN_S),
+            ):
+                sig_key = (key, coin)
+                last = self._last_signal_ts_ns.get(sig_key, 0)
+                if now_ns - last < cooldown * NS:
+                    continue
+                sig = fn(st, now_ns, rank, ret_24h, spread)
                 if sig is not None:
                     self._last_signal_ts_ns[sig_key] = now_ns
                     self._register_run(coin, now_ns, st.last_mid)
