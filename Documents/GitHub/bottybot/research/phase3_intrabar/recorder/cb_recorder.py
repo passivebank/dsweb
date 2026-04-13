@@ -37,6 +37,7 @@ import time
 import traceback
 import urllib.request
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
@@ -233,6 +234,7 @@ class Recorder:
         self._lat_window: deque[int] = deque(maxlen=2000)
         self._stop = False
         self._mkt = MarketContextPoller()
+        self._ret_24h: dict[str, float] = {}   # coin → (mid/open_24h) - 1
 
         # L2 plumbing
         self.book_tracker = BookTracker()
@@ -241,28 +243,59 @@ class Recorder:
         self._ws = None  # set inside _ws_loop so the sub manager can send mid-stream
 
     def _on_signal(self, sig: SignalEvent) -> None:
-        # Stamp market context onto features (propagates to all shadow trades)
+        coin = sig.coin
+        now_ns = sig.sig_ts_ns
+
+        # ── macro context (60s-refresh poller) ─────────────────────
         ctx = self._mkt.ctx
         if ctx:
-            sig.features.update({k: v for k, v in ctx.items()})
-        # BTC 1h return — free from existing engine state
+            sig.features.update(ctx)
+
+        # ── BTC 1h return (engine state — zero extra I/O) ───────────
         btc_st = self.engine.coins.get("BTC")
         if btc_st is not None:
             try:
-                sig.features["btc_ret_1h"] = round(btc_st.return_over(sig.sig_ts_ns, 3600), 5)
+                sig.features["btc_ret_1h"] = round(btc_st.return_over(now_ns, 3600), 5)
             except Exception:
                 pass
 
-        # Persist the signal
+        # ── CVD: cumulative volume delta (buy_usd - sell_usd) ───────
+        st = self.engine.coins.get(coin)
+        if st is not None:
+            sig.features["cvd_30s"] = round(st.cvd_in(now_ns, 30), 2)
+            sig.features["cvd_60s"] = round(st.cvd_in(now_ns, 60), 2)
+
+        # ── Order book imbalance: bid_depth_10 / ask_depth_10 ───────
+        # Only available if this coin is on the L2 watchlist.
+        bim = self.book_tracker.book_imbalance(coin)
+        if bim is not None:
+            sig.features["book_imbalance_10"] = bim
+
+        # ── 24h return (from ticker open_24h) ───────────────────────
+        ret24 = self._ret_24h.get(coin)
+        if ret24 is not None:
+            sig.features["ret_24h"] = round(ret24, 5)
+
+        # ── Time of day (UTC hour) ───────────────────────────────────
+        sig.features["utc_hour"] = datetime.now(timezone.utc).hour
+
+        # ── Prior signal history for this coin ──────────────────────
+        # Counts signals already recorded (including this one — engine
+        # called _record_signal_history before the callback).
+        sig.features["signals_24h"] = self.engine.signal_count_for(coin, now_ns, 86400)
+        sig.features["signals_1h"]  = self.engine.signal_count_for(coin, now_ns, 3600)
+
+        # ── Persist the signal ──────────────────────────────────────
         with self.signal_log.open("a") as f:
             f.write(json.dumps({
-                "variant": sig.variant,
-                "coin": sig.coin,
+                "variant":   sig.variant,
+                "coin":      sig.coin,
                 "sig_ts_ns": sig.sig_ts_ns,
-                "sig_mid": sig.sig_mid,
-                "features": sig.features,
+                "sig_mid":   sig.sig_mid,
+                "features":  sig.features,
             }) + "\n")
-        # Hand off to the shadow simulator
+
+        # ── Hand off to shadow simulator ────────────────────────────
         self.shadow.on_signal(sig)
 
     async def _heartbeat_loop(self) -> None:
@@ -423,6 +456,16 @@ class Recorder:
                 ask_f = float(ask)
             except Exception:
                 return
+            # Capture 24h open from ticker to compute ret_24h for signal features
+            open_24h = msg.get("open_24h")
+            if open_24h:
+                try:
+                    open_f = float(open_24h)
+                    if open_f > 0:
+                        coin_key = prod.split("-USD")[0]
+                        self._ret_24h[coin_key] = ((bid_f + ask_f) / 2.0) / open_f - 1.0
+                except Exception:
+                    pass
             rec = {
                 "ch": "quote", "prod": prod, "bid": bid_f, "ask": ask_f,
                 "bid_size": float(bid_size or 0), "ask_size": float(ask_size or 0),
