@@ -70,9 +70,25 @@ _FNG_URL       = "https://api.alternative.me/fng/?limit=1"
 _COINGECKO_URL = "https://api.coingecko.com/api/v3/global"
 _CONTEXT_INTERVAL_S = 60   # poll every 60 seconds
 
-_BINANCE_PRICE_URL      = "https://api.binance.com/api/v3/ticker/price"
-_COINGECKO_TRENDING_URL = "https://api.coingecko.com/api/v3/search/trending"
-_BINANCE_POLL_S         = 10
+_COINGECKO_TRENDING_URL  = "https://api.coingecko.com/api/v3/search/trending"
+# Binance spot — US stream first (works from AWS US), global as fallback
+_BINANCE_STREAM_URLS     = [
+    "wss://stream.binance.us:9443/ws/!miniTicker@arr",   # US — no geo-block
+    "wss://stream.binance.com:9443/ws/!miniTicker@arr",  # Global — blocked on AWS US
+]
+_BINANCE_REST_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"  # REST fallback
+_BINANCE_REST_FALLBACK_S = 3   # poll interval when WS unavailable
+# OKX futures REST (accessible from AWS US — Binance/Bybit are geo-blocked)
+# One call each for all funding rates and OI — no per-coin loops needed.
+_OKX_FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"   # per-symbol, but batched manually
+_OKX_OI_URL      = "https://www.okx.com/api/v5/public/open-interest?instType=SWAP"   # all at once
+_FUTURES_POLL_S  = 60
+# Top Coinbase coins that have OKX perp markets (coin-USDT-SWAP or coin-USD-SWAP)
+_FUTURES_TOP_COINS = [
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT",
+    "LTC", "ATOM", "TRX", "NEAR", "APT", "SUI", "INJ", "HBAR", "AAVE",
+    "PEPE", "OP", "ARB", "ICP", "FIL", "ETC", "BCH", "RUNE",
+]
 
 
 class MarketContextPoller:
@@ -153,55 +169,247 @@ class MarketContextPoller:
         except Exception:
             return None
 
-class BinancePricePoller:
-    """Polls Binance REST ticker every 10s for cross-exchange price comparison.
+class BinanceWSPoller:
+    """Real-time Binance spot prices, with REST fallback when WS is geo-blocked.
 
-    Fetches ALL Binance USDT pairs in one call (~300KB). Used to compute
-    Coinbase price premium vs Binance — a premium > 0.3% creates arbitrage
-    headwind that suppresses momentum.
+    On startup: probe each WS URL with a 10s timeout.
+    If a URL responds: run it forever with auto-reconnect.
+    If all URLs fail or are geo-blocked: fall back to REST every 3s.
+
+    AWS US-East blocks stream.binance.com (HTTP 451).
+    stream.binance.us may also be unreachable from some AWS regions.
+    REST api.binance.com is always reachable and is used as the fallback.
     """
 
     def __init__(self) -> None:
-        self._prices: dict[str, float] = {}
+        self._prices:  dict[str, float] = {}
+        self._ret_24h: dict[str, float] = {}
+        self._connected = False
         self._stop = False
 
     @property
     def prices(self) -> dict[str, float]:
         return self._prices
 
+    @property
+    def ret_24h(self) -> dict[str, float]:
+        return self._ret_24h
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
     async def run(self) -> None:
+        # Probe each WS URL; use the first that responds within 10s.
+        working_url: str | None = None
+        for url in _BINANCE_STREAM_URLS:
+            if self._stop:
+                return
+            try:
+                ws = await asyncio.wait_for(
+                    websockets.connect(url, open_timeout=10, max_size=2 ** 23),
+                    timeout=12,
+                )
+                await ws.close()
+                working_url = url
+                print(f"[binance-ws] probe OK: {url}", flush=True)
+                break
+            except Exception as e:
+                print(f"[binance-ws] probe failed {url}: {e}", flush=True)
+
+        if working_url is None:
+            print("[binance-ws] no WS reachable — REST poll every 3s", flush=True)
+            await self._rest_loop()
+            return
+
+        # Run WS forever with auto-reconnect
         while not self._stop:
             try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._refresh)
+                async with websockets.connect(
+                    working_url, ping_interval=20, ping_timeout=30, max_size=2 ** 23,
+                ) as ws:
+                    self._connected = True
+                    print(f"[binance-ws] streaming: {working_url}", flush=True)
+                    async for raw in ws:
+                        if self._stop:
+                            return
+                        self._parse_frame(raw)
+                    self._connected = False
             except Exception as e:
-                print(f"[binance] poll error: {e}", flush=True)
-            await asyncio.sleep(_BINANCE_POLL_S)
+                self._connected = False
+                print(f"[binance-ws] dropped: {e}; reconnecting in 5s", flush=True)
+                await asyncio.sleep(5)
+
+    def _parse_frame(self, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                return
+            prices: dict[str, float] = {}
+            rets:   dict[str, float] = {}
+            for item in data:
+                sym = item.get("s", "")
+                if (not sym.endswith("USDT")
+                        or sym.endswith("DOWNUSDT")
+                        or sym.endswith("UPUSDT")):
+                    continue
+                coin = sym[:-4]
+                try:
+                    c = float(item["c"])
+                    o = float(item["o"])
+                    prices[coin] = c
+                    if o > 0:
+                        rets[coin] = (c / o) - 1.0
+                except Exception:
+                    pass
+            if prices:
+                self._prices = prices
+            if rets:
+                self._ret_24h = rets
+        except Exception:
+            pass
+
+    async def _rest_loop(self) -> None:
+        loop = asyncio.get_event_loop()
+        while not self._stop:
+            try:
+                await loop.run_in_executor(None, self._refresh_rest)
+            except Exception as e:
+                print(f"[binance-rest] error: {e}", flush=True)
+            await asyncio.sleep(_BINANCE_REST_FALLBACK_S)
+
+    def _refresh_rest(self) -> None:
+        try:
+            req = urllib.request.Request(
+                _BINANCE_REST_TICKER_URL, headers={"User-Agent": USER_AGENT}
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            prices: dict[str, float] = {}
+            rets:   dict[str, float] = {}
+            for item in data:
+                sym = item.get("symbol", "")
+                if (not sym.endswith("USDT")
+                        or sym.endswith("DOWNUSDT")
+                        or sym.endswith("UPUSDT")):
+                    continue
+                coin = sym[:-4]
+                try:
+                    prices[coin] = float(item["lastPrice"])
+                    o = float(item["openPrice"])
+                    if o > 0:
+                        rets[coin] = (prices[coin] / o) - 1.0
+                except Exception:
+                    pass
+            if prices:
+                self._prices = prices
+            if rets:
+                self._ret_24h = rets
+        except Exception:
+            pass
 
     def stop(self) -> None:
         self._stop = True
 
-    def _refresh(self) -> None:
+
+class OKXFuturesPoller:
+    """Polls OKX perpetual futures for funding rates and open interest.
+
+    OKX is accessible from AWS US-East (Binance/Bybit are geo-blocked).
+
+    Two REST calls per cycle:
+      1. /public/open-interest?instType=SWAP — ALL 309 perp OI in one shot
+      2. /public/funding-rate?instId=<coin>-USDT-SWAP — per top-coin list
+
+    Signals stamped on each trade:
+      bn_funding_rate  — negative = shorts paying longs = squeeze fuel
+      bn_oi_delta_60s  — OI change over 60s: positive = new longs (sustainable),
+                         negative = short squeeze only (fades faster)
+    """
+
+    def __init__(self) -> None:
+        self._funding: dict[str, float] = {}    # coin -> current funding rate
+        self._oi: dict[str, deque] = {}         # coin -> deque[(ts_ns, oi_usd)]
+        self._stop = False
+
+    @property
+    def funding(self) -> dict[str, float]:
+        return self._funding
+
+    def oi_delta_60s(self, coin: str, now_ns: int) -> "float | None":
+        """Fraction change in OI over last 60s.  Positive = new longs entering."""
+        q = self._oi.get(coin)
+        if not q or len(q) < 2:
+            return None
+        cutoff = now_ns - 60 * NS
+        oldest = None
+        for ts, oi in q:
+            if ts >= cutoff:
+                oldest = oi
+                break
+        if oldest is None or oldest <= 0:
+            return None
+        return (q[-1][1] - oldest) / oldest
+
+    async def run(self) -> None:
+        while not self._stop:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._refresh_all)
+            except Exception as e:
+                print(f"[okx-futures] error: {e}", flush=True)
+            await asyncio.sleep(_FUTURES_POLL_S)
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _refresh_all(self) -> None:
+        now_ns = time.time_ns()
+        # Step 1: ALL OI in one call
         try:
-            req = urllib.request.Request(
-                _BINANCE_PRICE_URL,
-                headers={"User-Agent": USER_AGENT},
-            )
+            req = urllib.request.Request(_OKX_OI_URL, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read())
-            prices = {}
-            for item in data:
-                sym = item.get("symbol", "")
-                if sym.endswith("USDT") and not sym.endswith("DOWNUSDT") and not sym.endswith("UPUSDT"):
-                    coin = sym[:-4]
-                    try:
-                        prices[coin] = float(item["price"])
-                    except Exception:
-                        pass
-            if prices:
-                self._prices = prices
-        except Exception:
-            pass
+            for item in data.get("data", []):
+                inst = item.get("instId", "")
+                # Accept both coin-USDT-SWAP and coin-USD-SWAP
+                if not inst.endswith("-SWAP"):
+                    continue
+                parts = inst.split("-")
+                if len(parts) < 3:
+                    continue
+                coin = parts[0]
+                try:
+                    oi_usd = float(item.get("oiUsd") or item.get("oi") or 0)
+                    if oi_usd > 0:
+                        if coin not in self._oi:
+                            self._oi[coin] = deque(maxlen=30)
+                        self._oi[coin].append((now_ns, oi_usd))
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[okx-futures] OI fetch error: {e}", flush=True)
+
+        # Step 2: funding rates for top coins (individual calls, fast)
+        funding: dict[str, float] = {}
+        for coin in _FUTURES_TOP_COINS:
+            for suffix in (f"{coin}-USDT-SWAP", f"{coin}-USD-SWAP"):
+                try:
+                    url = f"{_OKX_FUNDING_URL}?instId={suffix}"
+                    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        d = json.loads(r.read())
+                    items = d.get("data") or []
+                    if items:
+                        rate = float(items[0].get("fundingRate", 0))
+                        funding[coin] = rate
+                        break   # found it, skip second suffix
+                except Exception:
+                    pass
+                time.sleep(0.02)
+        if funding:
+            self._funding = funding
+            print(f"[okx-futures] funding updated: {len(funding)} coins", flush=True)
 
 
 STABLECOINS = {
@@ -305,7 +513,8 @@ class Recorder:
         self._lat_window: deque[int] = deque(maxlen=2000)
         self._stop = False
         self._mkt = MarketContextPoller()
-        self._binance = BinancePricePoller()
+        self._binance = BinanceWSPoller()
+        self._bn_futures = OKXFuturesPoller()
         self._ret_24h: dict[str, float] = {}   # coin → (mid/open_24h) - 1
 
         # L2 plumbing
@@ -357,10 +566,25 @@ class Recorder:
         sig.features["signals_24h"] = self.engine.signal_count_for(coin, now_ns, 86400)
         sig.features["signals_1h"]  = self.engine.signal_count_for(coin, now_ns, 3600)
 
-        # ── Binance cross-exchange premium ───────────────────────────
+        # ── Binance cross-exchange premium (now real-time, not 10s lag) ─
         binance_px = self._binance.prices.get(coin)
         if binance_px and binance_px > 0 and sig.sig_mid > 0:
             sig.features["cb_binance_premium"] = round((sig.sig_mid / binance_px) - 1.0, 5)
+
+        # ── Binance 24h return (confirms move is cross-exchange, not CB only) ─
+        bn_ret = self._binance.ret_24h.get(coin)
+        if bn_ret is not None:
+            sig.features["bn_ret_24h"] = round(bn_ret, 5)
+
+        # ── Funding rate: negative = shorts paying longs = squeeze fuel ──
+        funding = self._bn_futures.funding.get(coin)
+        if funding is not None:
+            sig.features["bn_funding_rate"] = round(funding, 6)
+
+        # ── OI delta 60s: positive = new longs (sustainable), negative = shorts covering (fades) ──
+        oi_delta = self._bn_futures.oi_delta_60s(coin, now_ns)
+        if oi_delta is not None:
+            sig.features["bn_oi_delta_60s"] = round(oi_delta, 5)
 
         # ── CoinGecko trending ───────────────────────────────────────
         cg_trending = self._mkt.ctx.get("cg_trending")
@@ -610,6 +834,7 @@ class Recorder:
         self._stop = True
         self._mkt.stop()
         self._binance.stop()
+        self._bn_futures.stop()
 
     async def run(self) -> None:
         loop = asyncio.get_event_loop()
@@ -623,6 +848,7 @@ class Recorder:
                 self._subscription_manager_loop(),
                 self._mkt.run(),
                 self._binance.run(),
+                self._bn_futures.run(),
             )
         finally:
             print("[recorder] shutting down", flush=True)
