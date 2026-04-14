@@ -42,6 +42,8 @@ from .currently_ripping import (
     check_r5_confirmed_run,
     check_r6_local_breakout,
     check_r7_staircase,
+    check_r8_high_conviction,
+    check_r9_volume_staircase,
     R4_MIN_SECS_AFTER_RUN,
     R4_MAX_SECS_AFTER_RUN,
 )
@@ -85,6 +87,8 @@ class DetectorEngine:
         self.R5_COOLDOWN_S = 600     # 10-min cooldown — confirmed run can persist
         self.R6_COOLDOWN_S = 300     # 5-min cooldown — breakouts can repeat
         self.R7_COOLDOWN_S = 300     # 5-min cooldown
+        self.R8_COOLDOWN_S = 600     # 10-min cooldown — high conviction, rare signal
+        self.R9_COOLDOWN_S = 300     # 5-min cooldown — data-derived, fires moderately
         # per-coin signal history (any variant) — 24h rolling, for context features
         self._coin_signal_history: dict[str, deque] = defaultdict(deque)
         # 24h return per coin — fed from ticker open_24h via update_ret_24h()
@@ -254,9 +258,11 @@ class DetectorEngine:
         ret_24h = self._ret_24h.get(coin)
         if rank is not None and ret_24h is not None:
             for fn, key, cooldown in (
-                (check_r5_confirmed_run, "R5_CONFIRMED_RUN",  self.R5_COOLDOWN_S),
-                (check_r6_local_breakout,"R6_LOCAL_BREAKOUT", self.R6_COOLDOWN_S),
-                (check_r7_staircase,     "R7_STAIRCASE",      self.R7_COOLDOWN_S),
+                (check_r5_confirmed_run,    "R5_CONFIRMED_RUN",    self.R5_COOLDOWN_S),
+                (check_r6_local_breakout,   "R6_LOCAL_BREAKOUT",   self.R6_COOLDOWN_S),
+                (check_r7_staircase,        "R7_STAIRCASE",        self.R7_COOLDOWN_S),
+                (check_r8_high_conviction,  "R8_HIGH_CONVICTION",  self.R8_COOLDOWN_S),
+                (check_r9_volume_staircase, "R9_VOLUME_STAIRCASE", self.R9_COOLDOWN_S),
             ):
                 sig_key = (key, coin)
                 last = self._last_signal_ts_ns.get(sig_key, 0)
