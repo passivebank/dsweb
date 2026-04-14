@@ -51,6 +51,10 @@ class CoinState:
     trades: Deque[TradePoint] = field(default_factory=deque)
     mids: Deque[MidPoint] = field(default_factory=deque)
 
+    # Rolling spread history (last 600 observations) for dynamic spread gate.
+    # Stored as raw bps values; no timestamp needed since we cap by count.
+    spreads: Deque = field(default_factory=lambda: deque(maxlen=600))
+
     last_trade_ts_ns: int = 0
     last_mid: float = 0.0
     last_event_ts_ns: int = 0
@@ -84,6 +88,9 @@ class CoinState:
         self.mids.append(MidPoint(ts_ns, mid))
         self.last_mid = mid
         self.last_event_ts_ns = max(self.last_event_ts_ns, ts_ns)
+        spread_bps = (ask - bid) / mid * 1e4
+        if spread_bps > 0:
+            self.spreads.append(spread_bps)
         self._evict(ts_ns)
 
     # ---- queries used by detectors ------------------------------
@@ -224,6 +231,43 @@ class CoinState:
         if total <= 0:
             return 0.0
         return large / total
+
+    def typical_spread_bps(self, min_samples: int = 40) -> float:
+        """Rolling median spread_bps from recent quote history.
+
+        Returns 0.0 if fewer than min_samples observations have been seen
+        (caller should fall back to a fixed floor in that case).
+        """
+        if len(self.spreads) < min_samples:
+            return 0.0
+        return sorted(self.spreads)[len(self.spreads) // 2]
+
+    def dynamic_spread_gate(self,
+                             floor_bps: float = 10.0,
+                             cap_bps: float = 20.0,
+                             compression: float = 0.20,
+                             min_samples: int = 40) -> float:
+        """Max allowable spread_bps for signal qualification.
+
+        For liquid coins whose typical spread is near floor_bps, returns
+        floor_bps — identical to the old static gate (no behaviour change).
+
+        For illiquid/micro-cap coins whose typical spread is far above
+        floor_bps, the gate extends up to min(typical * compression, cap_bps).
+        This captures spread-compression events — a micro-cap coin that
+        normally trades at 80bps printing 5bps is experiencing a genuine
+        liquidity surge, not a routine tick.
+
+        Examples at default params (floor=10, cap=20, compression=0.20):
+          BTC  typical  2bps  → max(10, min(0.4, 20))  = 10bps  (unchanged)
+          SOL  typical  5bps  → max(10, min(1.0, 20))  = 10bps  (unchanged)
+          RAVE typical 80bps  → max(10, min(16,  20))  = 16bps  (extended)
+          thin typical 200bps → max(10, min(40,  20))  = 20bps  (capped)
+        """
+        typical = self.typical_spread_bps(min_samples=min_samples)
+        if typical <= 0:
+            return floor_bps  # insufficient history — conservative fallback
+        return max(floor_bps, min(typical * compression, cap_bps))
 
     def vwap_in(self, now_ns: int, lookback_s: int) -> float:
         """Volume-weighted average price over window. 0 if no trades."""

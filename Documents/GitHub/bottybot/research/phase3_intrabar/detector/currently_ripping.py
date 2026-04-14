@@ -1,20 +1,24 @@
 """
 currently_ripping.py — formal definitions of the CURRENTLY_RIPPING event.
 
-Four named variants:
-  R1_TAPE_BURST      — simultaneous top-rank + tape rate surge + clean return
+Variants:
+  R1_TAPE_BURST      — top-rank + tape rate surge + clean return
   R2_RANK_TAKEOVER   — coin jumps from mid-table into top-5 with velocity
   R3_DV_EXPLOSION    — dollar-volume burst regardless of rank
-  R4_POST_RUN_HOLD   — 5-60 min after an initial run, coin holding well
-                        with normalized book (the "continuation setup")
+  R4_POST_RUN_HOLD   — 5-60 min after initial run, coin holding well
+  R5_CONFIRMED_RUN   — already up 12%+ today AND green on all timeframes
+  R6_LOCAL_BREAKOUT  — consolidation breakout with volume burst
+  R7_STAIRCASE       — three consecutive 60s green steps, strong mover
+  R8_HIGH_CONVICTION — R7 quality gates plus whale presence required;
+                        the tightest signal, designed for highest win rate
 
-All signals carry:
-  variant / coin / sig_ts_ns / sig_mid / features dict
-
-Cross-sectional ranking is delegated to the engine. The engine now
-separates RANK_SPREAD_BPS (50bps — for awareness) from
-SIGNAL_SPREAD_BPS (30bps — gate for actually firing a signal), so
-thin coins appear in the rank table without being tradeable.
+Spread gates are DECOUPLED per signal tier:
+  R1/R2/R3: global SIGNAL_SPREAD_BPS (30bps) — broader for data capture
+  R5/R6/R7/R8: dynamic gate via CoinState.dynamic_spread_gate()
+    — floor 10bps for liquid coins (phase4 validated)
+    — extends to min(typical * 0.20, 20bps) for micro-caps experiencing
+      spread compression (e.g. RAVE at 80bps typical → up to 16bps allowed
+      when a liquidity surge compresses the book)
 """
 from __future__ import annotations
 
@@ -42,8 +46,15 @@ ELIG_MIN_TRADE_HISTORY_S = 60
 #                      Wider so thin/active coins are visible for R2 rank jumps.
 #   SIGNAL_SPREAD_BPS: max spread to actually fire a signal / open a trade.
 #                      Tighter — we won't trade into a wide book.
-RANK_SPREAD_BPS = 50.0
-SIGNAL_SPREAD_BPS = 30.0
+RANK_SPREAD_BPS    = 50.0
+SIGNAL_SPREAD_BPS  = 30.0   # R1/R2/R3 — kept wide for data collection
+
+# R5/R6/R7/R8 use CoinState.dynamic_spread_gate() instead of static thresholds.
+# These constants define the gate parameters (passed through to that method).
+# Phase4 data: ≤5bps PF 1.88, 5-10bps PF 1.58, 10-15bps PF 0.99 (breakeven).
+SPREAD_FLOOR_BPS    = 10.0  # always allow up to 10bps (large-cap baseline)
+SPREAD_CAP_BPS      = 20.0  # hard ceiling even at maximum compression
+SPREAD_COMPRESSION  = 0.20  # micro-cap must compress to ≤20% of typical
 
 TOP_K_RANK = 5          # widened from 3; Phase 4 can tighten based on data
 
@@ -296,12 +307,12 @@ def check_r4_post_run_hold(state: CoinState, now_ns: int,
 # Entry is cleaner because the book has normalized post-explosion.
 #
 # 15-min return requires mid_window_s >= 1800 in CoinState.
-R5_RET_24H_MIN   = 0.08    # already up 8%+ today
-R5_RET_15M_MIN   = 0.020   # green 15-min candle
-R5_RET_5M_MIN    = 0.008   # green 5-min candle
-R5_RET_1M_MIN    = 0.002   # still moving RIGHT NOW (green 1-min)
-R5_DV_TREND_MIN  = 0.70    # last-60s volume ≥ 70% of prior 60s (not drying up)
-R5_TOP_K_RANK    = 10      # must be a leader in the cross-section
+R5_RET_24H_MIN   = 0.12    # already up 12%+ today (was 8% — too many noise coins)
+R5_RET_15M_MIN   = 0.020   # green 15-min
+R5_RET_5M_MIN    = 0.008   # green 5-min
+R5_RET_1M_MIN    = 0.002   # still moving now
+R5_DV_TREND_MIN  = 0.70    # volume not drying up
+R5_TOP_K_RANK    = 10
 
 
 def check_r5_confirmed_run(state: CoinState, now_ns: int,
@@ -309,7 +320,7 @@ def check_r5_confirmed_run(state: CoinState, now_ns: int,
                            ret_24h: float,
                            spread_bps: float = 0.0) -> Optional[SignalEvent]:
     """Fires when a coin is confirmed running on all timeframes — not a spike."""
-    if spread_bps > SIGNAL_SPREAD_BPS:
+    if spread_bps > state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION):
         return None
     if rank_60s is None or rank_60s > R5_TOP_K_RANK:
         return None
@@ -337,13 +348,15 @@ def check_r5_confirmed_run(state: CoinState, now_ns: int,
         sig_ts_ns=now_ns,
         sig_mid=state.last_mid,
         features={
-            "ret_24h":   round(ret_24h, 5),
-            "ret_15m":   round(r15m, 5),
-            "ret_5m":    round(r5m, 5),
-            "ret_1m":    round(r1m, 5),
-            "dv_trend":  round(dv_trend, 3),
-            "rank_60s":  rank_60s,
-            "spread_bps": round(spread_bps, 1),
+            "ret_24h":          round(ret_24h, 5),
+            "ret_15m":          round(r15m, 5),
+            "ret_5m":           round(r5m, 5),
+            "ret_1m":           round(r1m, 5),
+            "dv_trend":         round(dv_trend, 3),
+            "rank_60s":         rank_60s,
+            "spread_bps":       round(spread_bps, 1),
+            "typical_spread":   round(state.typical_spread_bps(), 1),
+            "spread_gate_used": round(state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION), 1),
         },
     )
 
@@ -353,7 +366,7 @@ def check_r5_confirmed_run(state: CoinState, now_ns: int,
 # with a volume surge. The "second wind" pattern — price paused,
 # absorbed selling, then buyers stepped back in.
 # Requires coin is already a mover today (don't catch cold breakouts).
-R6_RET_24H_MIN        = 0.05   # already up 5%+ today
+R6_RET_24H_MIN        = 0.15   # raised from 0.05→0.15 per phase4 data: ret_24h<15% is net losing
 R6_CONSOLIDATION_S    = 180    # measure local high over prior 3 minutes
 R6_LOOKBACK_SKIP_S    = 20     # exclude last 20s from "prior high" (the breakout itself)
 R6_BREAKOUT_MIN_PCT   = 0.004  # must clear prior high by at least 0.4%
@@ -365,7 +378,7 @@ def check_r6_local_breakout(state: CoinState, now_ns: int,
                             ret_24h: float,
                             spread_bps: float = 0.0) -> Optional[SignalEvent]:
     """Fires on a confirmed breakout above a brief consolidation range."""
-    if spread_bps > SIGNAL_SPREAD_BPS:
+    if spread_bps > state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION):
         return None
     if ret_24h < R6_RET_24H_MIN:
         return None
@@ -413,7 +426,7 @@ def check_r6_local_breakout(state: CoinState, now_ns: int,
 # Three consecutive 1-minute green candles. Not a spike — a climb.
 # The most visually obvious "still going" pattern. Each 60s interval
 # must show positive return above a minimum threshold to exclude noise.
-R7_RET_24H_MIN   = 0.05    # already a mover today
+R7_RET_24H_MIN   = 0.12    # already up 12%+ today (was 5% — far too loose)
 R7_STEP_MIN_PCT  = 0.003   # each 60s step must be up ≥ 0.3%
 R7_TOP_K_RANK    = 10
 
@@ -423,7 +436,7 @@ def check_r7_staircase(state: CoinState, now_ns: int,
                        ret_24h: float,
                        spread_bps: float = 0.0) -> Optional[SignalEvent]:
     """Fires when the coin has posted 3 consecutive positive 1-min returns."""
-    if spread_bps > SIGNAL_SPREAD_BPS:
+    if spread_bps > state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION):
         return None
     if rank_60s is None or rank_60s > R7_TOP_K_RANK:
         return None
@@ -461,12 +474,99 @@ def check_r7_staircase(state: CoinState, now_ns: int,
     )
 
 
+# ----- R8 HIGH_CONVICTION -------------------------------------------
+# The tightest signal — all quality gates stacked simultaneously.
+# Designed to fire rarely but at the highest-confidence setups the
+# data identified: major mover + strong step structure + whale presence
+# + liquid book.  Every R8 that fires is worth examining.
+#
+# Data findings that drove these thresholds:
+#   - ret_24h > 12% filters out 70%+ of noise coins (CB-only micro-caps)
+#   - spread ≤ 12bps: Q1 spread bucket is the only one near breakeven
+#   - step_2m Q4 (> 0.011) is the only step quartile near breakeven
+#   - large_trade_pct > 0: whale filter → 65% win rate on existing data
+#   - rank ≤ 5: top 5 rather than top 10 — true market leaders
+R8_RET_24H_MIN       = 0.15    # major mover — up 15%+ today
+R8_STEP_MIN_PCT      = 0.005   # each 60s step ≥ 0.5% (stronger than R7's 0.3%)
+R8_STEP_2M_MIN       = 0.008   # middle step ≥ 0.8% — confirms acceleration
+R8_DV_TREND_MIN      = 0.90    # volume holding (not fading)
+R8_WHALE_PCT_MIN     = 0.05    # at least 5% of 60s volume from large trades
+R8_TOP_K_RANK        = 5       # top 5 only
+R8_LARGE_TRADE_USD   = 5_000   # threshold for "large trade" (same as state default)
+
+
+def check_r8_high_conviction(state: CoinState, now_ns: int,
+                              rank_60s: Optional[int],
+                              ret_24h: float,
+                              spread_bps: float = 0.0) -> Optional[SignalEvent]:
+    """Fires only when every quality gate passes simultaneously.
+
+    Designed to produce the smallest signal count but highest win rate.
+    Every gate was chosen because the data showed it individually improves
+    outcomes; all gates together should compound the edge.
+    """
+    if spread_bps > state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION):
+        return None
+    if rank_60s is None or rank_60s > R8_TOP_K_RANK:
+        return None
+    if ret_24h < R8_RET_24H_MIN:
+        return None
+
+    # Three consecutive steps — each must clear R8_STEP_MIN_PCT
+    steps = []
+    for i in range(1, 4):
+        end_ns   = now_ns - (i - 1) * 60 * NS
+        start_ns = now_ns - i       * 60 * NS
+        mid_end   = state.mid_at_or_before(end_ns)
+        mid_start = state.mid_at_or_before(start_ns)
+        if mid_start <= 0 or mid_end <= 0:
+            return None
+        step_ret = (mid_end / mid_start) - 1.0
+        if step_ret < R8_STEP_MIN_PCT:
+            return None
+        steps.append(round(step_ret, 5))
+
+    # Middle step (2-3 min ago) must show extra strength — confirms the
+    # move had legs in the middle, not just a last-second push.
+    if steps[1] < R8_STEP_2M_MIN:
+        return None
+
+    # Volume not fading
+    dv_trend = state.dv_trend(now_ns, 60)
+    if dv_trend < R8_DV_TREND_MIN:
+        return None
+
+    # Whale presence required — institutional validation of the move
+    whale_pct = state.large_trade_pct_in(now_ns, 60, threshold_usd=R8_LARGE_TRADE_USD)
+    if whale_pct < R8_WHALE_PCT_MIN:
+        return None
+
+    return SignalEvent(
+        variant="R8_HIGH_CONVICTION",
+        coin=state.coin,
+        sig_ts_ns=now_ns,
+        sig_mid=state.last_mid,
+        features={
+            "ret_24h":          round(ret_24h, 5),
+            "step_1m":          steps[0],
+            "step_2m":          steps[1],
+            "step_3m":          steps[2],
+            "total_3m":         round(sum(steps), 5),
+            "dv_trend":         round(dv_trend, 3),
+            "whale_pct_60s":    round(whale_pct, 3),
+            "rank_60s":         rank_60s,
+            "spread_bps":       round(spread_bps, 1),
+        },
+    )
+
+
 VARIANTS = [
-    ("R1_TAPE_BURST",    check_r1_tape_burst,    {"requires_prev_rank": False}),
-    ("R2_RANK_TAKEOVER", check_r2_rank_takeover, {"requires_prev_rank": True}),
-    ("R3_DV_EXPLOSION",  check_r3_dv_explosion,  {"requires_prev_rank": False}),
-    ("R4_POST_RUN_HOLD", check_r4_post_run_hold, {"requires_prev_rank": False, "engine_supplied": True}),
-    ("R5_CONFIRMED_RUN", check_r5_confirmed_run, {"requires_prev_rank": False, "requires_ret_24h": True}),
-    ("R6_LOCAL_BREAKOUT",check_r6_local_breakout,{"requires_prev_rank": False, "requires_ret_24h": True}),
-    ("R7_STAIRCASE",     check_r7_staircase,     {"requires_prev_rank": False, "requires_ret_24h": True}),
+    ("R1_TAPE_BURST",       check_r1_tape_burst,       {"requires_prev_rank": False}),
+    ("R2_RANK_TAKEOVER",    check_r2_rank_takeover,    {"requires_prev_rank": True}),
+    ("R3_DV_EXPLOSION",     check_r3_dv_explosion,     {"requires_prev_rank": False}),
+    ("R4_POST_RUN_HOLD",    check_r4_post_run_hold,    {"requires_prev_rank": False, "engine_supplied": True}),
+    ("R5_CONFIRMED_RUN",    check_r5_confirmed_run,    {"requires_prev_rank": False, "requires_ret_24h": True}),
+    ("R6_LOCAL_BREAKOUT",   check_r6_local_breakout,   {"requires_prev_rank": False, "requires_ret_24h": True}),
+    ("R7_STAIRCASE",        check_r7_staircase,        {"requires_prev_rank": False, "requires_ret_24h": True}),
+    ("R8_HIGH_CONVICTION",  check_r8_high_conviction,  {"requires_prev_rank": False, "requires_ret_24h": True}),
 ]
