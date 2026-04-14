@@ -70,6 +70,10 @@ _FNG_URL       = "https://api.alternative.me/fng/?limit=1"
 _COINGECKO_URL = "https://api.coingecko.com/api/v3/global"
 _CONTEXT_INTERVAL_S = 60   # poll every 60 seconds
 
+_BINANCE_PRICE_URL      = "https://api.binance.com/api/v3/ticker/price"
+_COINGECKO_TRENDING_URL = "https://api.coingecko.com/api/v3/search/trending"
+_BINANCE_POLL_S         = 10
+
 
 class MarketContextPoller:
     """Polls Fear & Greed + BTC dominance in a background async loop.
@@ -101,11 +105,14 @@ class MarketContextPoller:
         loop = asyncio.get_event_loop()
         fng = await loop.run_in_executor(None, self._fetch_fng)
         dom = await loop.run_in_executor(None, self._fetch_btc_dom)
+        trending = await loop.run_in_executor(None, self._fetch_trending)
         snap: dict = {}
         if fng is not None:
             snap["fear_greed"] = fng
         if dom is not None:
             snap["btc_dom_pct"] = round(dom, 2)
+        if trending:
+            snap["cg_trending"] = trending  # list of coin symbols
         if snap:
             self._ctx = snap
 
@@ -132,6 +139,70 @@ class MarketContextPoller:
             return float(d["data"]["market_cap_percentage"]["btc"])
         except Exception:
             return None
+
+    @staticmethod
+    def _fetch_trending() -> "list | None":
+        try:
+            req = urllib.request.Request(
+                _COINGECKO_TRENDING_URL,
+                headers={"User-Agent": USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read())
+            return [c["item"]["symbol"].upper() for c in d.get("coins", [])]
+        except Exception:
+            return None
+
+class BinancePricePoller:
+    """Polls Binance REST ticker every 10s for cross-exchange price comparison.
+
+    Fetches ALL Binance USDT pairs in one call (~300KB). Used to compute
+    Coinbase price premium vs Binance — a premium > 0.3% creates arbitrage
+    headwind that suppresses momentum.
+    """
+
+    def __init__(self) -> None:
+        self._prices: dict[str, float] = {}
+        self._stop = False
+
+    @property
+    def prices(self) -> dict[str, float]:
+        return self._prices
+
+    async def run(self) -> None:
+        while not self._stop:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._refresh)
+            except Exception as e:
+                print(f"[binance] poll error: {e}", flush=True)
+            await asyncio.sleep(_BINANCE_POLL_S)
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _refresh(self) -> None:
+        try:
+            req = urllib.request.Request(
+                _BINANCE_PRICE_URL,
+                headers={"User-Agent": USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            prices = {}
+            for item in data:
+                sym = item.get("symbol", "")
+                if sym.endswith("USDT") and not sym.endswith("DOWNUSDT") and not sym.endswith("UPUSDT"):
+                    coin = sym[:-4]
+                    try:
+                        prices[coin] = float(item["price"])
+                    except Exception:
+                        pass
+            if prices:
+                self._prices = prices
+        except Exception:
+            pass
+
 
 STABLECOINS = {
     "USDT", "USDC", "DAI", "PYUSD", "USDP", "GUSD", "TUSD", "BUSD", "USDS",
@@ -234,6 +305,7 @@ class Recorder:
         self._lat_window: deque[int] = deque(maxlen=2000)
         self._stop = False
         self._mkt = MarketContextPoller()
+        self._binance = BinancePricePoller()
         self._ret_24h: dict[str, float] = {}   # coin → (mid/open_24h) - 1
 
         # L2 plumbing
@@ -284,6 +356,24 @@ class Recorder:
         # called _record_signal_history before the callback).
         sig.features["signals_24h"] = self.engine.signal_count_for(coin, now_ns, 86400)
         sig.features["signals_1h"]  = self.engine.signal_count_for(coin, now_ns, 3600)
+
+        # ── Binance cross-exchange premium ───────────────────────────
+        binance_px = self._binance.prices.get(coin)
+        if binance_px and binance_px > 0 and sig.sig_mid > 0:
+            sig.features["cb_binance_premium"] = round((sig.sig_mid / binance_px) - 1.0, 5)
+
+        # ── CoinGecko trending ───────────────────────────────────────
+        cg_trending = self._mkt.ctx.get("cg_trending")
+        if cg_trending is not None:
+            sig.features["cg_trending"] = coin.upper() in cg_trending
+
+        # ── Ask depth and bid depth at signal time ───────────────────
+        ask_d = self.book_tracker.total_ask_depth_usd(coin)
+        bid_d = self.book_tracker.total_bid_depth_usd(coin)
+        if ask_d > 0:
+            sig.features["ask_depth_usd"] = round(ask_d, 2)
+        if bid_d > 0:
+            sig.features["bid_depth_usd"] = round(bid_d, 2)
 
         # ── Persist the signal ──────────────────────────────────────
         with self.signal_log.open("a") as f:
@@ -498,6 +588,10 @@ class Recorder:
                 top["server_ts_ns"] = server_ts_ns
                 self.writer.write(top)
                 self.stats["books_emitted"] += 1
+            # Feed ask depth to engine for trend tracking
+            ask_depth = self.book_tracker.total_ask_depth_usd(base)
+            if ask_depth > 0:
+                self.engine.update_ask_depth(base, ask_depth, recv_ns)
             rec = {"ch": "book10", "server_ts_ns": server_ts_ns} if server_ts_ns else None
         elif t in ("subscriptions", "heartbeat"):
             return
@@ -515,6 +609,7 @@ class Recorder:
     def stop(self) -> None:
         self._stop = True
         self._mkt.stop()
+        self._binance.stop()
 
     async def run(self) -> None:
         loop = asyncio.get_event_loop()
@@ -527,6 +622,7 @@ class Recorder:
                 self._heartbeat_loop(),
                 self._subscription_manager_loop(),
                 self._mkt.run(),
+                self._binance.run(),
             )
         finally:
             print("[recorder] shutting down", flush=True)

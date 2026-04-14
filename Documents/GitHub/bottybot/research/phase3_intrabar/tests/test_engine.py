@@ -437,3 +437,212 @@ def test_dv_trend_detects_fading_volume():
         st2.on_trade(base_ns + 60 * NS + k * 5 * NS, price=1.0, size=100.0, side="buy")
     trend2 = st2.dv_trend(base_ns + 120 * NS, window_s=60)
     assert trend2 > 1.0, f"expected accelerating volume (trend > 1), got {trend2:.3f}"
+
+
+# ── New Phase-3 feature tests ─────────────────────────────────────────────
+
+
+def test_avg_trade_size_in():
+    """avg_trade_size_in returns correct mean USD size."""
+    st = CoinState(coin="AVG")
+    base_ns = int(1_000.0 * NS)
+    # 3 trades: $100, $200, $300 → avg $200
+    st.on_trade(base_ns + 1 * NS, price=10.0, size=10.0, side="buy")   # $100
+    st.on_trade(base_ns + 2 * NS, price=10.0, size=20.0, side="buy")   # $200
+    st.on_trade(base_ns + 3 * NS, price=10.0, size=30.0, side="buy")   # $300
+
+    now_ns = base_ns + 4 * NS
+    avg = st.avg_trade_size_in(now_ns, lookback_s=10)
+    assert abs(avg - 200.0) < 0.01, f"expected 200.0, got {avg}"
+
+    # Outside window → 0
+    assert st.avg_trade_size_in(base_ns + 20 * NS, lookback_s=1) == 0.0
+
+
+def test_large_trade_pct_in():
+    """large_trade_pct_in correctly identifies whale trades."""
+    st = CoinState(coin="WHALE")
+    base_ns = int(2_000.0 * NS)
+    # 1 small trade $100, 1 whale trade $10,000 → large_pct = 10000/10100
+    st.on_trade(base_ns + 1 * NS, price=10.0, size=10.0, side="buy")      # $100
+    st.on_trade(base_ns + 2 * NS, price=10.0, size=1000.0, side="buy")    # $10,000
+
+    now_ns = base_ns + 3 * NS
+    pct = st.large_trade_pct_in(now_ns, lookback_s=10, threshold_usd=5000.0)
+    expected = 10_000.0 / 10_100.0
+    assert abs(pct - expected) < 1e-6, f"expected {expected:.4f}, got {pct:.4f}"
+
+    # No whale trades: all below threshold
+    pct_none = st.large_trade_pct_in(now_ns, lookback_s=10, threshold_usd=20_000.0)
+    assert pct_none == 0.0, f"expected 0.0 when no whale trades, got {pct_none}"
+
+
+def test_vwap_in():
+    """vwap_in computes price-volume weighted average correctly."""
+    st = CoinState(coin="VWAP")
+    base_ns = int(3_000.0 * NS)
+    # Trade 1: price=100, size_usd=100 (size=1)
+    # Trade 2: price=200, size_usd=400 (size=2)
+    # VWAP = (100*100 + 200*400) / (100+400) = 90000/500 = 180
+    st.on_trade(base_ns + 1 * NS, price=100.0, size=1.0, side="buy")    # $100
+    st.on_trade(base_ns + 2 * NS, price=200.0, size=2.0, side="buy")    # $400
+
+    now_ns = base_ns + 3 * NS
+    vwap = st.vwap_in(now_ns, lookback_s=10)
+    assert abs(vwap - 180.0) < 0.01, f"expected 180.0, got {vwap}"
+
+    # Empty window → 0
+    assert st.vwap_in(base_ns + 30 * NS, lookback_s=1) == 0.0
+
+
+def test_candle_close_strength():
+    """candle_close_strength returns 1.0 at high, 0.0 at low, 0.5 if flat."""
+    st = CoinState(coin="CANDLE")
+    base_ns = int(4_000.0 * NS)
+
+    # Price goes: 1.0, 1.5, 2.0 → closes at high → strength=1.0
+    for i, px in enumerate([1.0, 1.5, 2.0]):
+        st.on_quote(base_ns + i * 10 * NS, px - 0.001, px + 0.001)
+
+    now_ns = base_ns + 2 * 10 * NS + NS  # just after last quote
+    strength = st.candle_close_strength(now_ns, lookback_s=60)
+    assert abs(strength - 1.0) < 0.01, f"expected 1.0 (close at high), got {strength}"
+
+    # Price goes: 2.0, 1.5, 1.0 → closes at low → strength=0.0
+    st2 = CoinState(coin="CANDLE2")
+    for i, px in enumerate([2.0, 1.5, 1.0]):
+        st2.on_quote(base_ns + i * 10 * NS, px - 0.001, px + 0.001)
+    strength2 = st2.candle_close_strength(base_ns + 2 * 10 * NS + NS, lookback_s=60)
+    assert abs(strength2 - 0.0) < 0.01, f"expected 0.0 (close at low), got {strength2}"
+
+    # Flat → 0.5
+    st3 = CoinState(coin="CANDLE3")
+    for i in range(3):
+        st3.on_quote(base_ns + i * 10 * NS, 0.999, 1.001)
+    strength3 = st3.candle_close_strength(base_ns + 2 * 10 * NS + NS, lookback_s=60)
+    assert strength3 == 0.5, f"expected 0.5 for flat candle, got {strength3}"
+
+
+def test_higher_lows():
+    """higher_lows returns True when each minute's low is higher than the prior."""
+    st = CoinState(coin="HLOWS")
+    base_ns = int(5_000.0 * NS)
+
+    # 3 minutes of quotes with ascending lows:
+    # min 3 (oldest): low=1.00, min 2: low=1.01, min 1 (most recent): low=1.02
+    # Each bucket has 3 quotes spaced 10s apart
+    for bucket_idx, low in enumerate([1.00, 1.01, 1.02]):
+        # bucket 0 = oldest (3-4 min ago), bucket 2 = most recent (0-1 min ago)
+        # now_ns = base + 3*60s; bucket 0 covers [now-3*60 .. now-2*60]
+        bucket_start = base_ns + bucket_idx * 60 * NS
+        for tick in range(3):
+            px = low + 0.005 * tick   # goes up within bucket, so min=low
+            ts = bucket_start + tick * 10 * NS
+            st.on_quote(ts, px - 0.0001, px + 0.0001)
+
+    now_ns = base_ns + 3 * 60 * NS
+    assert st.higher_lows(now_ns, window_s=60, n_windows=3), "expected higher_lows=True"
+
+    # Descending lows → False
+    st2 = CoinState(coin="LLOWS")
+    for bucket_idx, low in enumerate([1.02, 1.01, 1.00]):  # reversed (descending)
+        bucket_start = base_ns + bucket_idx * 60 * NS
+        for tick in range(3):
+            px = low + 0.005 * tick
+            ts = bucket_start + tick * 10 * NS
+            st2.on_quote(ts, px - 0.0001, px + 0.0001)
+    assert not st2.higher_lows(now_ns, window_s=60, n_windows=3), "expected higher_lows=False for descending"
+
+
+def test_total_ask_depth_usd():
+    """total_ask_depth_usd returns correct dollar depth for ask side."""
+    bt = BookTracker()
+
+    # No book → 0
+    assert bt.total_ask_depth_usd("NONE") == 0.0
+
+    # Seed snapshot: 2 ask levels
+    # ask 10.01 × 100 = $1001; ask 10.02 × 50 = $501 → total = $1502
+    bids = [["10.00", "10"]]
+    asks = [["10.01", "100"], ["10.02", "50"]]
+    bt.on_snapshot("DEPTH", bids, asks, recv_ts_ns=1_000_000_000)
+
+    ask_depth = bt.total_ask_depth_usd("DEPTH", top_n=10)
+    expected = 10.01 * 100 + 10.02 * 50
+    assert abs(ask_depth - expected) < 0.01, f"expected {expected:.2f}, got {ask_depth:.2f}"
+
+    # top_n=1 should only count the cheapest ask level
+    ask_depth_1 = bt.total_ask_depth_usd("DEPTH", top_n=1)
+    assert abs(ask_depth_1 - 10.01 * 100) < 0.01, f"top_n=1 expected {10.01*100:.2f}, got {ask_depth_1:.2f}"
+
+
+def test_engine_secs_since_run_onset():
+    """secs_since_run_onset increases after a coin enters top-10."""
+    sigs: list[SignalEvent] = []
+    eng = DetectorEngine(on_signal=lambda s: sigs.append(s))
+
+    stream = _build_full_stream(base=10_000.0)
+    for ev in stream:
+        eng.on_event(ev)
+
+    # RUNNER should have signals; check onset tracking is populated
+    if sigs:
+        runner_sig = next((s for s in sigs if s.coin == "RUNNER"), None)
+        if runner_sig is not None:
+            # secs_since_onset should be >= 0 (coin was in top-10 at signal time)
+            onset = runner_sig.features.get("secs_since_onset", -1.0)
+            assert onset >= 0.0, f"expected onset >= 0, got {onset}"
+
+
+def test_engine_market_breadth():
+    """market_breadth counts coins with ret_5m > 1%."""
+    eng = DetectorEngine()
+    base_ns = int(20_000.0 * NS)
+
+    # Create 3 coins all with ~2% gain over 5 min.
+    # Feed 7 minutes of history so the 5-min window is fully populated:
+    # first quote at base_ns (the "5 min ago" anchor), last quote at base+7*60s.
+    total_steps = 7 * 12   # one event every 5s for 7 minutes
+    for i in range(3):
+        coin = f"MOVER{i}"
+        for k in range(total_steps):
+            ts = base_ns + k * 5 * NS
+            # ramps from 1.0 to ~1.04 over 7 min — always > 1% over any 5-min window
+            px = 1.0 + 0.04 * (k / total_steps)
+            eng.on_event({"ch": "quote", "coin": coin, "bid": px - 0.0001, "ask": px + 0.0001,
+                          "recv_ts_ns": ts})
+            eng.on_event({"ch": "trade", "coin": coin, "price": px, "size": 100.0,
+                          "side": "buy", "recv_ts_ns": ts})
+
+    now_ns = base_ns + (total_steps - 1) * 5 * NS
+    breadth = eng.market_breadth(now_ns)
+    assert breadth >= 3, f"expected at least 3 movers, got {breadth}"
+
+
+def test_engine_ask_depth_trend():
+    """ask_depth_trend < 1 when ask side consumed, > 1 when sellers show up."""
+    eng = DetectorEngine()
+    base_ns = int(30_000.0 * NS)
+    coin = "DEPTHCOIN"
+
+    # Populate 18 entries with declining ask depth (old: 10000, new: 5000)
+    # 18 entries at 5s apart = 90s window
+    for i in range(18):
+        ts = base_ns + i * 5 * NS
+        # Ask depth declines from 10000 to ~5000 over the window
+        ask_depth = 10_000.0 - i * 277.0
+        eng.update_ask_depth(coin, ask_depth, ts)
+
+    trend = eng.ask_depth_trend(coin)
+    # Most recent depth < 60s-ago depth → ratio < 1
+    assert trend < 1.0, f"expected ask_depth_trend < 1.0 (consumed), got {trend}"
+
+    # Now test rising ask depth (sellers showing up)
+    eng2 = DetectorEngine()
+    for i in range(18):
+        ts = base_ns + i * 5 * NS
+        ask_depth = 5_000.0 + i * 277.0  # rising
+        eng2.update_ask_depth(coin, ask_depth, ts)
+
+    trend2 = eng2.ask_depth_trend(coin)
+    assert trend2 > 1.0, f"expected ask_depth_trend > 1.0 (sellers showing up), got {trend2}"

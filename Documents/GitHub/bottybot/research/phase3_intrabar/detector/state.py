@@ -201,3 +201,67 @@ class CoinState:
             else:
                 sell_usd += tp.size_usd
         return buy_usd - sell_usd
+
+    def avg_trade_size_in(self, now_ns: int, lookback_s: int) -> float:
+        """Average USD size per trade in window. Larger = institutional interest."""
+        cutoff = now_ns - lookback_s * NS
+        sizes = [tp.size_usd for tp in reversed(self.trades) if tp.ts_ns >= cutoff]
+        if not sizes:
+            return 0.0
+        return sum(sizes) / len(sizes)
+
+    def large_trade_pct_in(self, now_ns: int, lookback_s: int, threshold_usd: float = 5000.0) -> float:
+        """Fraction of dollar volume from trades >= threshold_usd. Whale proxy."""
+        cutoff = now_ns - lookback_s * NS
+        total = 0.0
+        large = 0.0
+        for tp in reversed(self.trades):
+            if tp.ts_ns < cutoff:
+                break
+            total += tp.size_usd
+            if tp.size_usd >= threshold_usd:
+                large += tp.size_usd
+        if total <= 0:
+            return 0.0
+        return large / total
+
+    def vwap_in(self, now_ns: int, lookback_s: int) -> float:
+        """Volume-weighted average price over window. 0 if no trades."""
+        cutoff = now_ns - lookback_s * NS
+        vol_px = 0.0
+        vol = 0.0
+        for tp in reversed(self.trades):
+            if tp.ts_ns < cutoff:
+                break
+            vol_px += tp.price * tp.size_usd
+            vol += tp.size_usd
+        if vol <= 0:
+            return 0.0
+        return vol_px / vol
+
+    def candle_close_strength(self, now_ns: int, lookback_s: int = 60) -> float:
+        """Where in the candle's high-low range did we close?
+        1.0 = closed at high (strong). 0.0 = closed at low (weak). 0.5 if flat."""
+        cutoff = now_ns - lookback_s * NS
+        mids_in = [mp.mid for mp in self.mids if mp.ts_ns >= cutoff]
+        if len(mids_in) < 2:
+            return 0.5
+        high = max(mids_in)
+        low = min(mids_in)
+        if high == low:
+            return 0.5
+        return (mids_in[-1] - low) / (high - low)
+
+    def higher_lows(self, now_ns: int, window_s: int = 60, n_windows: int = 3) -> bool:
+        """True if the low of each consecutive window_s bucket is higher than the prior.
+        n_windows=3 checks 3 consecutive minutes. Confirms sustained buying pressure."""
+        lows = []
+        for i in range(n_windows):
+            start = now_ns - (i + 1) * window_s * NS
+            end   = now_ns - i       * window_s * NS
+            bucket = [mp.mid for mp in self.mids if start <= mp.ts_ns < end]
+            if not bucket:
+                return False
+            lows.append(min(bucket))
+        # lows[0] = most recent, lows[n-1] = oldest — must be ascending from old to new
+        return all(lows[i] > lows[i + 1] for i in range(len(lows) - 1))

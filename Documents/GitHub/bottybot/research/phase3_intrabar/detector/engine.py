@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+from datetime import datetime, timezone
 
 from .currently_ripping import (
     ELIG_DV_300S_USD,
@@ -88,6 +89,14 @@ class DetectorEngine:
         self._coin_signal_history: dict[str, deque] = defaultdict(deque)
         # 24h return per coin — fed from ticker open_24h via update_ret_24h()
         self._ret_24h: dict[str, float] = {}
+        # Run onset: when each coin first entered top-10 by 60s return
+        self._run_onset: dict[str, int] = {}
+        # Ask depth history per coin: deque of (ts_ns, ask_depth_usd) — last 90s
+        self._ask_depth_hist: dict[str, deque] = defaultdict(lambda: deque(maxlen=18))
+        # First-signal-today tracking: set of (coin, 'YYYY-MM-DD') strings
+        self._first_signal_today: set = set()
+        # Market breadth cache: (ts_ns, count)
+        self._breadth_cache: tuple = (0, 0)
 
     # ----- external feed-ins ----------------------------------
 
@@ -168,6 +177,14 @@ class DetectorEngine:
             while hist and hist[0].ts_ns < cutoff:
                 hist.popleft()
 
+        # Update run onset tracking
+        for coin in list(self._run_onset.keys()):
+            if self._cached_rank.get(coin, 999) > 10:
+                del self._run_onset[coin]
+        for coin, rank in self._cached_rank.items():
+            if rank <= 10 and coin not in self._run_onset:
+                self._run_onset[coin] = now_ns
+
     def _prev_min_rank(self, coin: str, now_ns: int) -> Optional[int]:
         hist = self._rank_history.get(coin)
         if not hist:
@@ -211,6 +228,20 @@ class DetectorEngine:
                 else:
                     sig = fn(st, now_ns, rank, spread)
                 if sig is not None:
+                    # Stamp engine-level context features onto every signal
+                    sig.features["secs_since_onset"]   = round(self.secs_since_run_onset(coin, now_ns), 1)
+                    sig.features["market_breadth_5m"]  = self.market_breadth(now_ns)
+                    sig.features["ask_depth_trend"]    = self.ask_depth_trend(coin)
+                    sig.features["first_signal_today"] = self.pop_first_signal_today(coin, now_ns)
+                    btc_st = self.coins.get("BTC")
+                    coin_ret5m = st.return_over(now_ns, 300)
+                    btc_ret5m  = btc_st.return_over(now_ns, 300) if btc_st else 0.0
+                    sig.features["btc_rel_ret_5m"]     = round(coin_ret5m - btc_ret5m, 5)
+                    sig.features["avg_trade_size_60s"] = round(st.avg_trade_size_in(now_ns, 60), 2)
+                    sig.features["large_trade_pct_60s"]= round(st.large_trade_pct_in(now_ns, 60), 3)
+                    sig.features["vwap_300s"]          = round(st.vwap_in(now_ns, 300), 8)
+                    sig.features["candle_close_str_1m"]= round(st.candle_close_strength(now_ns, 60), 3)
+                    sig.features["higher_lows_3m"]     = st.higher_lows(now_ns, window_s=60, n_windows=3)
                     self._last_signal_ts_ns[sig_key] = now_ns
                     self._register_run(coin, now_ns, st.last_mid)
                     self._record_signal_history(coin, now_ns)
@@ -233,6 +264,20 @@ class DetectorEngine:
                     continue
                 sig = fn(st, now_ns, rank, ret_24h, spread)
                 if sig is not None:
+                    # Stamp engine-level context features onto every signal
+                    sig.features["secs_since_onset"]   = round(self.secs_since_run_onset(coin, now_ns), 1)
+                    sig.features["market_breadth_5m"]  = self.market_breadth(now_ns)
+                    sig.features["ask_depth_trend"]    = self.ask_depth_trend(coin)
+                    sig.features["first_signal_today"] = self.pop_first_signal_today(coin, now_ns)
+                    btc_st = self.coins.get("BTC")
+                    coin_ret5m = st.return_over(now_ns, 300)
+                    btc_ret5m  = btc_st.return_over(now_ns, 300) if btc_st else 0.0
+                    sig.features["btc_rel_ret_5m"]     = round(coin_ret5m - btc_ret5m, 5)
+                    sig.features["avg_trade_size_60s"] = round(st.avg_trade_size_in(now_ns, 60), 2)
+                    sig.features["large_trade_pct_60s"]= round(st.large_trade_pct_in(now_ns, 60), 3)
+                    sig.features["vwap_300s"]          = round(st.vwap_in(now_ns, 300), 8)
+                    sig.features["candle_close_str_1m"]= round(st.candle_close_strength(now_ns, 60), 3)
+                    sig.features["higher_lows_3m"]     = st.higher_lows(now_ns, window_s=60, n_windows=3)
                     self._last_signal_ts_ns[sig_key] = now_ns
                     self._register_run(coin, now_ns, st.last_mid)
                     self._record_signal_history(coin, now_ns)
@@ -260,6 +305,20 @@ class DetectorEngine:
                         spread_bps=spread,
                     )
                     if sig is not None:
+                        # Stamp engine-level context features onto every signal
+                        sig.features["secs_since_onset"]   = round(self.secs_since_run_onset(coin, now_ns), 1)
+                        sig.features["market_breadth_5m"]  = self.market_breadth(now_ns)
+                        sig.features["ask_depth_trend"]    = self.ask_depth_trend(coin)
+                        sig.features["first_signal_today"] = self.pop_first_signal_today(coin, now_ns)
+                        btc_st = self.coins.get("BTC")
+                        coin_ret5m = st.return_over(now_ns, 300)
+                        btc_ret5m  = btc_st.return_over(now_ns, 300) if btc_st else 0.0
+                        sig.features["btc_rel_ret_5m"]     = round(coin_ret5m - btc_ret5m, 5)
+                        sig.features["avg_trade_size_60s"] = round(st.avg_trade_size_in(now_ns, 60), 2)
+                        sig.features["large_trade_pct_60s"]= round(st.large_trade_pct_in(now_ns, 60), 3)
+                        sig.features["vwap_300s"]          = round(st.vwap_in(now_ns, 300), 8)
+                        sig.features["candle_close_str_1m"]= round(st.candle_close_strength(now_ns, 60), 3)
+                        sig.features["higher_lows_3m"]     = st.higher_lows(now_ns, window_s=60, n_windows=3)
                         self._last_signal_ts_ns[sig_key] = now_ns
                         self._record_signal_history(coin, now_ns)
                         if self.on_signal is not None:
@@ -287,6 +346,61 @@ class DetectorEngine:
             return 0
         cutoff = now_ns - lookback_s * NS
         return sum(1 for ts in hist if ts >= cutoff)
+
+    def update_ask_depth(self, coin: str, ask_depth_usd: float, ts_ns: int) -> None:
+        """Called by recorder after each L2 update. Tracks ask depth over time."""
+        self._ask_depth_hist[coin].append((ts_ns, ask_depth_usd))
+
+    def ask_depth_trend(self, coin: str) -> float:
+        """ask_depth_now / ask_depth_60s_ago.
+        < 1.0 = ask wall being consumed (bullish).
+        > 1.0 = sellers showing up (bearish).
+        Returns 1.0 if insufficient history."""
+        hist = self._ask_depth_hist.get(coin)
+        if not hist or len(hist) < 2:
+            return 1.0
+        now_ts, now_depth = hist[-1]
+        if now_depth <= 0:
+            return 1.0
+        cutoff = now_ts - 60 * NS
+        old_depth = None
+        for ts, depth in hist:
+            if ts >= cutoff:
+                old_depth = depth
+                break
+        if old_depth is None or old_depth <= 0:
+            return 1.0
+        return round(now_depth / old_depth, 3)
+
+    def market_breadth(self, now_ns: int) -> int:
+        """Number of coins with ret_5m > 1% right now. Cached every 5s."""
+        cache_ts, cache_val = self._breadth_cache
+        if now_ns - cache_ts < 5 * NS:
+            return cache_val
+        count = sum(
+            1 for st in self.coins.values()
+            if st.last_event_ts_ns + 30 * NS >= now_ns
+            and st.return_over(now_ns, 300) > 0.01
+        )
+        self._breadth_cache = (now_ns, count)
+        return count
+
+    def secs_since_run_onset(self, coin: str, now_ns: int) -> float:
+        """Seconds since this coin first entered top-10. -1 if not currently in top-10."""
+        onset = self._run_onset.get(coin)
+        if onset is None:
+            return -1.0
+        return (now_ns - onset) / NS
+
+    def pop_first_signal_today(self, coin: str, now_ns: int) -> bool:
+        """Returns True the FIRST time a signal fires for this coin today (UTC).
+        Subsequent calls return False. Side-effect: marks the coin as seen."""
+        day = datetime.fromtimestamp(now_ns / 1e9, tz=timezone.utc).strftime('%Y-%m-%d')
+        key = f"{coin}:{day}"
+        if key not in self._first_signal_today:
+            self._first_signal_today.add(key)
+            return True
+        return False
 
     def _register_run(self, coin: str, now_ns: int, mid: float) -> None:
         """Called when any R1/R2/R3 fires; starts or refreshes the R4 tracker.

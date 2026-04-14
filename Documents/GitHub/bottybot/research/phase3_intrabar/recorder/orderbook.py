@@ -139,5 +139,21 @@ class BookTracker:
             return None
         return round(bid_depth / ask_depth, 3)
 
+    def total_ask_depth_usd(self, coin: str, top_n: int = 10) -> float:
+        """Total dollar value of ask-side top_n price levels."""
+        st = self.books.get(coin)
+        if st is None or not st.asks:
+            return 0.0
+        asks_top = sorted(st.asks.items(), key=lambda x: x[0])[:top_n]
+        return sum(p * s for p, s in asks_top)
+
+    def total_bid_depth_usd(self, coin: str, top_n: int = 10) -> float:
+        """Total dollar value of bid-side top_n price levels."""
+        st = self.books.get(coin)
+        if st is None or not st.bids:
+            return 0.0
+        bids_top = sorted(st.bids.items(), key=lambda x: -x[0])[:top_n]
+        return sum(p * s for p, s in bids_top)
+
     def drop(self, coin: str) -> None:
         self.books.pop(coin, None)
