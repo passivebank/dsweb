@@ -79,8 +79,10 @@ EXIT_POLICIES = [
     # scale_out_30m: partial TP at +2%, then 2% trail on remainder, 30 min max
     ("scale_out_30m",   0.020, 0.020, None,  0.020, None,  None, 1800, None, None),
     # r5_v10: validated exit policy from multi_runner_v10 backtest (52 trades, 73% WR, +5.05% EV)
-    # 7% hard stop + 7% trail pre-partial → 50% exit at +20% → 15% trail post-partial, 30-min cap
-    ("r5_v10",          0.070, 0.070, None,  0.200, None,  None, 1800, None, 0.150),
+    # 7% hard stop + 7% trail pre-partial → 50% exit at +20% → 15% trail post-partial
+    # Time cap 14400s (240 min) matches backtest max hold — INX held 240 min for +38.5%.
+    # 30-min cap would cut 25/51 trades and halve EV from +5.2% to +2.8%. Do not shorten.
+    ("r5_v10",          0.070, 0.070, None,  0.200, None,  None, 14400, None, 0.150),
 ]
 
 PULLBACK_POLICIES     = [       # only wide-exit policies — pullback entries need room
