@@ -50,31 +50,37 @@ PULLBACK_RECOVER_PCT  = 0.002   # enter when price recovers 0.2% from pullback l
 PULLBACK_MAX_WAIT_S   = 120     # give up after 2 minutes
 
 # --- exit policies ---------------------------------------------------
-# (name, hard_stop, trail, tp_full, tp_partial, pullback, flow_decay, time_s, be_activate)
+# (name, hard_stop, trail, tp_full, tp_partial, pullback, flow_decay, time_s,
+#  be_activate, trail_after_partial)
 # be_activate: if set, trailing stop is dormant until price reaches
 #              entry * (1 + be_activate), then stop moves to breakeven and trails.
+# trail_after_partial: if set, trail switches to this value once half_closed is True.
+#   Enables the v10 two-phase trail: tighter pre-partial, wider post-partial.
 EXIT_POLICIES = [
     # --- short-term (original set) ---
-    ("tight_trail",     0.006, 0.004, None,  None,  None,  None, 60,   None),
-    ("std_trail",       0.008, 0.005, None,  None,  None,  None, 120,  None),
-    ("tp_only",         0.008, None,  0.012, None,  None,  None, 180,  None),
-    ("partial_trail",   0.008, 0.005, None,  0.010, None,  None, 180,  None),
-    ("pullback_exit",   0.008, None,  None,  None,  0.005, None, 120,  None),
-    ("flow_decay",      0.008, 0.006, None,  None,  None,  0.5,  180,  None),
-    ("time_30s",        0.010, None,  None,  None,  None,  None, 30,   None),
-    ("time_60s",        0.010, None,  None,  None,  None,  None, 60,   None),
-    ("time_120s",       0.010, None,  None,  None,  None,  None, 120,  None),
-    ("time_300s",       0.010, None,  None,  None,  None,  None, 300,  None),
+    ("tight_trail",     0.006, 0.004, None,  None,  None,  None, 60,   None, None),
+    ("std_trail",       0.008, 0.005, None,  None,  None,  None, 120,  None, None),
+    ("tp_only",         0.008, None,  0.012, None,  None,  None, 180,  None, None),
+    ("partial_trail",   0.008, 0.005, None,  0.010, None,  None, 180,  None, None),
+    ("pullback_exit",   0.008, None,  None,  None,  0.005, None, 120,  None, None),
+    ("flow_decay",      0.008, 0.006, None,  None,  None,  0.5,  180,  None, None),
+    ("time_30s",        0.010, None,  None,  None,  None,  None, 30,   None, None),
+    ("time_60s",        0.010, None,  None,  None,  None,  None, 60,   None, None),
+    ("time_120s",       0.010, None,  None,  None,  None,  None, 120,  None, None),
+    ("time_300s",       0.010, None,  None,  None,  None,  None, 300,  None, None),
     # --- wide / long-hold (new — designed for sustained runs) ---
     # wide_trail_10m: 2% stop, 1.5% trail, exits after 10 min max
-    ("wide_trail_10m",  0.020, 0.015, None,  None,  None,  None, 600,  None),
+    ("wide_trail_10m",  0.020, 0.015, None,  None,  None,  None, 600,  None, None),
     # wide_trail_30m: 3% stop, 2% trail, exits after 30 min max
-    ("wide_trail_30m",  0.030, 0.020, None,  None,  None,  None, 1800, None),
+    ("wide_trail_30m",  0.030, 0.020, None,  None,  None,  None, 1800, None, None),
     # breakeven_trail: tight 1% stop initially; once up 1%, stop moves to
     #   breakeven and then trails 1.5%; exits after 20 min max
-    ("breakeven_trail", 0.010, 0.015, None,  None,  None,  None, 1200, 0.010),
+    ("breakeven_trail", 0.010, 0.015, None,  None,  None,  None, 1200, 0.010, None),
     # scale_out_30m: partial TP at +2%, then 2% trail on remainder, 30 min max
-    ("scale_out_30m",   0.020, 0.020, None,  0.020, None,  None, 1800, None),
+    ("scale_out_30m",   0.020, 0.020, None,  0.020, None,  None, 1800, None, None),
+    # r5_v10: validated exit policy from multi_runner_v10 backtest (52 trades, 73% WR, +5.05% EV)
+    # 7% hard stop + 7% trail pre-partial → 50% exit at +20% → 15% trail post-partial, 30-min cap
+    ("r5_v10",          0.070, 0.070, None,  0.200, None,  None, 1800, None, 0.150),
 ]
 
 PULLBACK_POLICIES     = [       # only wide-exit policies — pullback entries need room
@@ -234,7 +240,12 @@ class ShadowSimulator:
                 continue
 
             (name, hard_stop, trail, tp_full, tp_partial,
-             pullback_pct, flow_decay, time_s, be_activate) = op.exit_policy
+             pullback_pct, flow_decay, time_s, be_activate,
+             trail_after_partial) = op.exit_policy
+            # Use wider trail once partial exit has fired (v10 two-phase trail)
+            eff_trail = (trail_after_partial
+                         if (op.half_closed and trail_after_partial is not None)
+                         else trail)
 
             if px > op.max_px:
                 op.max_px = px
@@ -251,7 +262,7 @@ class ShadowSimulator:
             if be_activate is not None and op.be_activated:
                 # Stop is max(breakeven, trailing_stop_from_peak)
                 be_stop = op.entry_px
-                trail_stop = op.max_px * (1 - trail) if trail else 0.0
+                trail_stop = op.max_px * (1 - eff_trail) if eff_trail else 0.0
                 effective_stop = max(be_stop, trail_stop)
                 if px <= effective_stop:
                     exit_reason = "trail_be_stop"
@@ -270,11 +281,11 @@ class ShadowSimulator:
                       and px >= op.entry_px * (1 + tp_partial)):
                     op.half_closed    = True
                     op.half_closed_px = op.entry_px * (1 + tp_partial)
-                elif (trail is not None and be_activate is None
+                elif (eff_trail is not None and be_activate is None
                       and op.max_px > op.entry_px
-                      and px <= op.max_px * (1 - trail)):
+                      and px <= op.max_px * (1 - eff_trail)):
                     exit_reason = "trailing_stop"
-                    exit_px     = op.max_px * (1 - trail)
+                    exit_px     = op.max_px * (1 - eff_trail)
                 elif (pullback_pct is not None and op.max_px > 0
                       and (op.max_px - px) / op.max_px >= pullback_pct):
                     exit_reason = "pullback"

@@ -308,10 +308,26 @@ def check_r4_post_run_hold(state: CoinState, now_ns: int,
 #
 # 15-min return requires mid_window_s >= 1800 in CoinState.
 R5_RET_24H_MIN   = 0.12    # already up 12%+ today (was 8% — too many noise coins)
+R5_RET_24H_EXHST_LO = 1.0  # exhaustion zone: 100-200% 24h gain = dangerous late entry
+R5_RET_24H_EXHST_HI = 2.0  # above 200% = still running (MEZO-type outlier), allow
+# Backtest data: r24 1.0-2.0 tier = 39% WR, -24.7% total across 18 trades
+# r24 < 1.0 = 67% WR +201%; r24 > 2.0 = 47% WR +52% (outlier movers still worth it)
 R5_RET_15M_MIN   = 0.020   # green 15-min
-R5_RET_5M_MIN    = 0.008   # green 5-min
+# r5m bimodal: consolidation entry (0.5-1%) OR surge entry (3%+)
+# "uncanny valley" 1-3% = decelerating momentum, ~0.66% EV → blocked
+# v10 backtest: 0.5-1% bucket 24 trades 83% WR; 3%+ bucket 27 trades 67% WR
+R5_RET_5M_LO_MIN = 0.005   # consolidation entry floor
+R5_RET_5M_LO_MAX = 0.010   # consolidation entry ceiling (exclusive)
+R5_RET_5M_HI_MIN = 0.030   # surge entry floor (no ceiling)
 R5_RET_1M_MIN    = 0.002   # still moving now
-R5_DV_TREND_MIN  = 0.70    # volume not drying up
+# dvt bimodal: steady stable (1.0-1.5) OR institutional tsunami (2.5+)
+# moderate surge (1.5-2.5) = net negative EV in backtest → blocked
+# floor at 1.0 is critical — dvt < 1.0 = declining volume = do not enter
+# v10 backtest: [1.0,1.5) bucket 29 trades 72% WR; [2.5,∞) bucket 21 trades 81% WR
+R5_DVT_STBL_MIN  = 1.0     # stable volume floor
+R5_DVT_STBL_MAX  = 1.5     # stable volume ceiling (exclusive)
+R5_DVT_SURGE_MIN = 2.5     # institutional surge floor (no ceiling)
+R5_SPREAD_MAX_BPS = 10.0   # hard cap: >10bps is net losing in backtest (replaces dynamic gate)
 R5_TOP_K_RANK    = 10
 
 
@@ -319,12 +335,29 @@ def check_r5_confirmed_run(state: CoinState, now_ns: int,
                            rank_60s: Optional[int],
                            ret_24h: float,
                            spread_bps: float = 0.0) -> Optional[SignalEvent]:
-    """Fires when a coin is confirmed running on all timeframes — not a spike."""
-    if spread_bps > state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION):
+    """Fires when a coin is confirmed running on all timeframes — not a spike.
+
+    Exhaustion filter: block entries when ret_24h is in the 100-200% zone.
+    Coins up 100-200% in 24h are in late-stage euphoria (39% WR in backtest).
+    Allow r24 > 200% — those are genuine outlier movers still accelerating.
+
+    r5m bimodal filter (v10): accept consolidation entries (0.5-1%) OR surge
+    entries (3%+). The 1-3% "uncanny valley" is decelerating momentum — EV ~0.66%.
+
+    dvt bimodal filter (v10): accept steady stable volume (1.0-1.5x) OR
+    institutional tsunami (2.5x+). Moderate surge (1.5-2.5x) is net negative.
+    Floor at 1.0 is critical — dvt < 1.0 means declining volume, do not enter.
+
+    Spread hard cap (v10): 10bps maximum. >10bps is net losing in backtest.
+    """
+    if spread_bps > R5_SPREAD_MAX_BPS:
         return None
     if rank_60s is None or rank_60s > R5_TOP_K_RANK:
         return None
     if ret_24h < R5_RET_24H_MIN:
+        return None
+    # Exhaustion zone: 100-200% 24h gain → losing tier (39% WR, -24.7% total)
+    if R5_RET_24H_EXHST_LO <= ret_24h < R5_RET_24H_EXHST_HI:
         return None
 
     r15m = state.return_over(now_ns, 900)
@@ -333,13 +366,17 @@ def check_r5_confirmed_run(state: CoinState, now_ns: int,
 
     if r15m < R5_RET_15M_MIN:
         return None
-    if r5m < R5_RET_5M_MIN:
+    # Bimodal r5m: consolidation entry (0.5-1%) OR surge entry (3%+)
+    r5m_bimodal = (R5_RET_5M_LO_MIN <= r5m < R5_RET_5M_LO_MAX) or (r5m >= R5_RET_5M_HI_MIN)
+    if not r5m_bimodal:
         return None
     if r1m < R5_RET_1M_MIN:
         return None
 
     dv_trend = state.dv_trend(now_ns, 60)
-    if dv_trend < R5_DV_TREND_MIN:
+    # Bimodal dvt: stable volume (1.0-1.5) OR institutional surge (2.5+)
+    dvt_bimodal = (R5_DVT_STBL_MIN <= dv_trend < R5_DVT_STBL_MAX) or (dv_trend >= R5_DVT_SURGE_MIN)
+    if not dvt_bimodal:
         return None
 
     return SignalEvent(
@@ -356,7 +393,6 @@ def check_r5_confirmed_run(state: CoinState, now_ns: int,
             "rank_60s":         rank_60s,
             "spread_bps":       round(spread_bps, 1),
             "typical_spread":   round(state.typical_spread_bps(), 1),
-            "spread_gate_used": round(state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION), 1),
         },
     )
 
