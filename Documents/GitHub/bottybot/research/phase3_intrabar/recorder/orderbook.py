@@ -11,9 +11,14 @@ watchlist alone. We log a top-10 image at ~1 Hz which is sufficient
 resolution to model "the book moved N levels in 250-1000 ms while my
 order was in flight."
 
-Memory: each coin holds two flat dicts (bids: price→size, asks:
-price→size). For ~50 watchlist coins with ~1000 levels each, total
-memory is well under 50 MB.
+Book-level cap (MAX_BOOK_LEVELS):
+  Each side is capped at MAX_BOOK_LEVELS active price levels.
+  Without a cap, bids/asks grow unboundedly as new price levels are seen
+  over hours of trading.  max()/min()/sorted() calls are O(n) or O(n log n),
+  so a 1800-level book after 1.5h is ~36× slower than a fresh book —
+  causing monotonically increasing event-loop latency and eventual crash.
+  Capping at 50 keeps all operations O(1) while retaining enough depth
+  for accurate top-10 calculations.
 """
 from __future__ import annotations
 
@@ -25,6 +30,11 @@ NS = 1_000_000_000
 # Emission gating
 MIN_SPACING_NS = 100_000_000          # 100 ms minimum between emissions per coin
 PERIODIC_INTERVAL_NS = 1_000_000_000  # 1 s baseline emission cadence
+
+# Book depth cap — keeps sorted()/max()/min() calls O(1) over long runs.
+# We only ever read top-10, so 50 per side is more than sufficient.
+MAX_BOOK_LEVELS = 50
+TRIM_THRESHOLD  = 100  # prune when either side exceeds this; amortises sort cost
 
 
 @dataclass
@@ -65,6 +75,13 @@ class BookTracker:
                 continue
             if s > 0:
                 st.asks[p] = s
+        # Trim immediately — snapshots can arrive with hundreds of levels.
+        if len(st.bids) > MAX_BOOK_LEVELS:
+            keep = sorted(st.bids.keys(), reverse=True)[:MAX_BOOK_LEVELS]
+            st.bids = {p: st.bids[p] for p in keep}
+        if len(st.asks) > MAX_BOOK_LEVELS:
+            keep = sorted(st.asks.keys())[:MAX_BOOK_LEVELS]
+            st.asks = {p: st.asks[p] for p in keep}
         self.books[coin] = st
         return self._maybe_emit(coin, recv_ts_ns, force=True)
 
@@ -86,6 +103,15 @@ class BookTracker:
                 d.pop(price, None)
             else:
                 d[price] = size
+        # Batch-prune when either side exceeds TRIM_THRESHOLD.
+        # Amortised cost: O(log n) per update; keeps max()/min()/sorted()
+        # calls bounded to O(MAX_BOOK_LEVELS) for the lifetime of the run.
+        if len(st.bids) > TRIM_THRESHOLD:
+            keep = sorted(st.bids.keys(), reverse=True)[:MAX_BOOK_LEVELS]
+            st.bids = {p: st.bids[p] for p in keep}
+        if len(st.asks) > TRIM_THRESHOLD:
+            keep = sorted(st.asks.keys())[:MAX_BOOK_LEVELS]
+            st.asks = {p: st.asks[p] for p in keep}
         return self._maybe_emit(coin, recv_ts_ns)
 
     def _maybe_emit(self, coin: str, ts_ns: int, force: bool = False) -> dict | None:
