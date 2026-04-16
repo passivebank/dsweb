@@ -32,12 +32,17 @@ SLIP            = 0.0003
 MIN_ORDER_USD   = 5.0
 MAX_HOLD_S      = 14400   # 4h hard cap
 
-# ── v10 entry filter gates (data-validated 2026-04-16) ───────────────
-# Feature analysis over 31 live-regime trades showed these three gates
-# raise adj_EV from +0.45% → +3.15% at 57% pass rate.
-GATE_SIGNALS_1H  = 4    # skip if coin fired 4+ signals in last hour (exhaustion)
-GATE_SIGNALS_24H = 10   # skip if coin fired 10+ signals today (chop pattern)
-GATE_ONSET_S     = 15.0 # skip if 15+ seconds since the move started (late entry)
+# ── v10 entry filter gates ───────────────────────────────────────────
+GATE_ONSET_S = 15.0  # skip if 15+ seconds since the move started (late entry)
+
+# Per-coin cooldown after exit: prevents re-entry on a coin that just reversed.
+# Keyed on exit classification; elapsed time must exceed cooldown before re-entry.
+COOLDOWN_S = {
+    "TRAIL_STOP_FULL":    90 * 60,  # stopped out without partial — full reversal
+    "TRAIL_STOP_PARTIAL": 20 * 60,  # had partial, overall profitable — short cooldown
+    "TIME_CAP_LOSS":      60 * 60,  # timed out underwater — slow bleed coin
+    "TIME_CAP_GAIN":      20 * 60,  # timed out profitable — allow fresh re-entry soon
+}
 
 CB_ENV_FILE = Path("/home/ec2-user/nkn_bot/.env")
 
@@ -144,6 +149,9 @@ class LiveExecutor:
         self._usd_cache     = 0.0
         self._usd_cache_ts  = 0.0
 
+        # per-coin exit state for cooldown gate
+        self._last_exit: dict = {}  # coin → (exit_ts_s: float, cooldown_key: str)
+
         self._thread = threading.Thread(target=self._worker, daemon=True, name="live-exec")
         self._thread.start()
         # restore any positions that were open when the service last stopped
@@ -232,6 +240,15 @@ class LiveExecutor:
                     log.info(f"[EXIT] {coin} {reason} gain={gain:+.1%} held={hold_min:.1f}m Tier={pos['tier']}")
                     self._log("EXIT", coin, price, gain=gain, reason=reason,
                               hold_min=round(hold_min, 1), tier=pos["tier"])
+                    # Classify exit and arm the per-coin cooldown gate
+                    if reason == "TRAIL_STOP":
+                        ck = "TRAIL_STOP_PARTIAL" if pos.get("half_sold") else "TRAIL_STOP_FULL"
+                    elif reason == "TIME_CAP":
+                        ck = "TIME_CAP_GAIN" if gain >= 0 else "TIME_CAP_LOSS"
+                    else:
+                        ck = "TIME_CAP_GAIN"
+                    self._last_exit[coin] = (time.time(), ck)
+                    log.info(f"[COOLDOWN] {coin} → {ck} ({COOLDOWN_S.get(ck, 0) // 60}m)")
 
             except Exception as e:
                 log.error(f"[WORKER ERR] {e}", exc_info=True)
@@ -250,21 +267,26 @@ class LiveExecutor:
             log.info(f"[SKIP] {coin} Tier={tier} F&G={fear_greed} — extreme fear, consolidation skip")
             return
 
-        # signals_1h gate: coin firing 4+ times in last hour = exhaustion chop, not run.
-        # Live feature analysis: signals_1h<4 raises adj_EV from +0.45% → +2.89%.
-        signals_1h  = sig.features.get("signals_1h", 0)
-        signals_24h = sig.features.get("signals_24h", 0)
-        secs_onset  = sig.features.get("secs_since_onset", 0.0)
-
-        if signals_1h >= GATE_SIGNALS_1H:
-            log.info(f"[SKIP] {coin} signals_1h={signals_1h} >= {GATE_SIGNALS_1H} — hourly exhaustion")
-            return
-        if signals_24h >= GATE_SIGNALS_24H:
-            log.info(f"[SKIP] {coin} signals_24h={signals_24h} >= {GATE_SIGNALS_24H} — daily chop")
-            return
+        secs_onset = sig.features.get("secs_since_onset", 0.0)
         if secs_onset >= GATE_ONSET_S:
             log.info(f"[SKIP] {coin} secs_since_onset={secs_onset:.1f}s >= {GATE_ONSET_S}s — late entry")
             return
+
+        # Per-coin cooldown gate: if this coin recently stopped us out or timed out at a
+        # loss, require a minimum rest period before re-entering. If the coin makes a
+        # fresh genuine breakout after the cooldown expires, it trades freely.
+        last = self._last_exit.get(coin)
+        if last is not None:
+            exit_ts, cooldown_key = last
+            cooldown  = COOLDOWN_S.get(cooldown_key, 0)
+            elapsed   = time.time() - exit_ts
+            if elapsed < cooldown:
+                remaining_m = (cooldown - elapsed) / 60
+                log.info(
+                    f"[SKIP] {coin} cooldown={cooldown_key} "
+                    f"remaining={remaining_m:.0f}m"
+                )
+                return
 
         with self._lock:
             if coin in self._positions:
@@ -380,6 +402,40 @@ class LiveExecutor:
         # Any coin with a non-empty stack has an open position
         open_pos = {coin: entries[-1]
                     for coin, entries in stacks.items() if entries}
+
+        # Second pass: restore _last_exit from the most recent EXIT per coin so
+        # cooldowns survive service restarts.
+        last_exits: dict = {}
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                continue
+            if rec.get("event") in ("EXIT", "SELL") and rec.get("coin"):
+                last_exits[rec["coin"]] = rec   # keeps last occurrence (latest in file)
+        for coin, rec in last_exits.items():
+            reason = rec.get("reason", "")
+            gain   = float(rec.get("gain", 0.0))
+            ts_raw = rec.get("ts", "")
+            try:
+                exit_ts = datetime.fromisoformat(
+                    ts_raw.rstrip("Z")
+                ).replace(tzinfo=_tz.utc).timestamp()
+            except Exception:
+                exit_ts = time.time()
+            if reason == "TRAIL_STOP":
+                ck = "TRAIL_STOP_PARTIAL" if gain > 0 else "TRAIL_STOP_FULL"
+            elif reason == "TIME_CAP":
+                ck = "TIME_CAP_GAIN" if gain >= 0 else "TIME_CAP_LOSS"
+            else:
+                ck = "TIME_CAP_GAIN"
+            self._last_exit[coin] = (exit_ts, ck)
+            remaining = max(0.0, (COOLDOWN_S.get(ck, 0) - (time.time() - exit_ts)) / 60)
+            if remaining > 0:
+                log.info(f"[RECONCILE] {coin} cooldown={ck} remaining={remaining:.0f}m")
 
         if not open_pos:
             log.info("[RECONCILE] no open positions found")
