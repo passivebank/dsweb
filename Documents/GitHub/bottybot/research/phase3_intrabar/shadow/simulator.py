@@ -40,8 +40,8 @@ from detector.currently_ripping import SignalEvent
 from detector.state import NS
 
 # --- entry -----------------------------------------------------------
-ENTRY_DELAYS_MS_DEFAULT = [250, 500, 1000, 2000, 3000]
-ENTRY_DELAYS_MS_R4      = [2000, 5000, 15000, 30000]   # post-run has less urgency
+ENTRY_DELAYS_MS_DEFAULT = [250]          # r5_v10 only: 250ms live timing
+ENTRY_DELAYS_MS_R4      = [2000]         # r4 only: single delay
 ENTRY_MAX_SPREAD_BPS    = 30.0   # skip entry if book is too wide
 
 # Pullback entry parameters — alternative to fixed-delay entry
@@ -57,37 +57,13 @@ PULLBACK_MAX_WAIT_S   = 120     # give up after 2 minutes
 # trail_after_partial: if set, trail switches to this value once half_closed is True.
 #   Enables the v10 two-phase trail: tighter pre-partial, wider post-partial.
 EXIT_POLICIES = [
-    # --- short-term (original set) ---
-    ("tight_trail",     0.006, 0.004, None,  None,  None,  None, 60,   None, None),
-    ("std_trail",       0.008, 0.005, None,  None,  None,  None, 120,  None, None),
-    ("tp_only",         0.008, None,  0.012, None,  None,  None, 180,  None, None),
-    ("partial_trail",   0.008, 0.005, None,  0.010, None,  None, 180,  None, None),
-    ("pullback_exit",   0.008, None,  None,  None,  0.005, None, 120,  None, None),
-    ("flow_decay",      0.008, 0.006, None,  None,  None,  0.5,  180,  None, None),
-    ("time_30s",        0.010, None,  None,  None,  None,  None, 30,   None, None),
-    ("time_60s",        0.010, None,  None,  None,  None,  None, 60,   None, None),
-    ("time_120s",       0.010, None,  None,  None,  None,  None, 120,  None, None),
-    ("time_300s",       0.010, None,  None,  None,  None,  None, 300,  None, None),
-    # --- wide / long-hold (new — designed for sustained runs) ---
-    # wide_trail_10m: 2% stop, 1.5% trail, exits after 10 min max
-    ("wide_trail_10m",  0.020, 0.015, None,  None,  None,  None, 600,  None, None),
-    # wide_trail_30m: 3% stop, 2% trail, exits after 30 min max
-    ("wide_trail_30m",  0.030, 0.020, None,  None,  None,  None, 1800, None, None),
-    # breakeven_trail: tight 1% stop initially; once up 1%, stop moves to
-    #   breakeven and then trails 1.5%; exits after 20 min max
-    ("breakeven_trail", 0.010, 0.015, None,  None,  None,  None, 1200, 0.010, None),
-    # scale_out_30m: partial TP at +2%, then 2% trail on remainder, 30 min max
-    ("scale_out_30m",   0.020, 0.020, None,  0.020, None,  None, 1800, None, None),
-    # r5_v10: validated exit policy from multi_runner_v10 backtest (52 trades, 73% WR, +5.05% EV)
-    # 7% hard stop + 7% trail pre-partial → 50% exit at +20% → 15% trail post-partial
-    # Time cap 14400s (240 min) matches backtest max hold — INX held 240 min for +38.5%.
-    # 30-min cap would cut 25/51 trades and halve EV from +5.2% to +2.8%. Do not shorten.
+    # Reduced to r5_v10 only: 1 policy × 1 delay = 1 shadow entry per signal.
+    # 7% hard stop + 7% trail → 50% partial at +20% → 15% trail post-partial, 4h cap
     ("r5_v10",          0.070, 0.070, None,  0.200, None,  None, 14400, None, 0.150),
 ]
 
-PULLBACK_POLICIES     = [       # only wide-exit policies — pullback entries need room
-    p for p in EXIT_POLICIES if p[0] in ("wide_trail_10m", "wide_trail_30m", "scale_out_30m", "breakeven_trail")
-]
+PULLBACK_POLICIES = []          # no wide-exit variants active
+
 
 # --- cost model ------------------------------------------------------
 TAKER_FEE       = 0.0015
@@ -173,8 +149,13 @@ class ShadowSimulator:
 
     def on_signal(self, sig: SignalEvent) -> None:
         self.n_signals_seen += 1
-        # R4 uses its own delay set; all others use the standard set
-        delays = ENTRY_DELAYS_MS_R4 if sig.variant == "R4_POST_RUN_HOLD" else ENTRY_DELAYS_MS_DEFAULT
+        # Only shadow-track R5_CONFIRMED_RUN with r5_v10 exit policy.
+        # Tracking all 8 variants with the 4h-cap policy causes open positions
+        # to accumulate ~8x faster → latency creep. Non-R5 variants are not
+        # traded live so their shadow data has no research value here.
+        if sig.variant != "R5_CONFIRMED_RUN":
+            return
+        delays = ENTRY_DELAYS_MS_DEFAULT
         for delay_ms in delays:
             for policy in EXIT_POLICIES:
                 self.pending.append(_PendingEntry(

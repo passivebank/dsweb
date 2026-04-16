@@ -78,29 +78,43 @@ def test_engine_fires_on_synthetic_runner():
 
 
 def test_simulator_records_trades():
+    # Inject an R5 signal then crash price to trigger the 7% r5_v10 trail stop.
+    # The simulator only tracks R5_CONFIRMED_RUN; the engine-driven stream fires
+    # R1/R7 which would be silently skipped, so we inject the signal directly.
     with tempfile.TemporaryDirectory() as tmp:
         log = Path(tmp) / "trades.jsonl"
         eng = DetectorEngine()
         sim = ShadowSimulator(log_path=log, engine=eng)
-        eng.on_signal = sim.on_signal
 
-        stream = _build_full_stream()
-        # also append several minutes of post-event quiet trades to let
-        # all the open positions resolve via time stops
-        coin = "RUNNER"
-        last_ts = stream[-1]["recv_ts_ns"] / NS
-        for k in range(120):
-            ts = last_ts + 1 + k * 5
-            stream.append(_trade(coin, ts, 1.020, size=100.0))
-        for ev in stream:
-            eng.on_event(ev)
+        from detector.currently_ripping import SignalEvent
+        coin     = "RUNNER5"
+        base_ns  = int(10_000.0 * NS)
+        entry_px = 1.030
+        sig = SignalEvent(
+            variant="R5_CONFIRMED_RUN", coin=coin,
+            sig_ts_ns=base_ns, sig_mid=entry_px,
+            features={"confidence_tier": "D", "fear_greed": 50,
+                      "ret_24h": 0.15, "ret_5m": 0.05, "dv_trend": 3.0,
+                      "spread_bps": 5.0},
+        )
+        sim.on_signal(sig)
+
+        # Flat at entry, then crash 12% below peak so the 7% trail fires.
+        events = []
+        for k in range(30):
+            ts = base_ns + (k + 1) * NS
+            events.append(_trade(coin, ts / NS, entry_px, size=100.0))
+        for k in range(30):
+            ts = base_ns + (31 + k) * NS
+            events.append(_trade(coin, ts / NS, 0.910, size=100.0))
+        for ev in events:
             sim.on_event(ev)
 
-        assert sim.n_signals_seen > 0, "no signals fired"
-        assert sim.n_trades_closed > 0, "signals fired but no trades closed"
-        lines = log.read_text().strip().splitlines()
-        assert len(lines) == sim.n_trades_closed
-        for line in lines:
+        assert sim.n_signals_seen > 0, "signal not counted"
+        assert sim.n_trades_closed > 0, "no trade closed after price crash"
+        lines2 = log.read_text().strip().splitlines()
+        assert len(lines2) == sim.n_trades_closed
+        for line in lines2:
             rec = json.loads(line)
             for k in ("variant", "delay_ms", "exit_policy", "net_pct", "gross_pct"):
                 assert k in rec
@@ -371,7 +385,7 @@ def test_r6_fires_on_local_breakout():
     # now = consolidation_end + 15s → breakout trades at 0/5/10s are within last 15s
     # prior_high window is [now-180s .. now-20s] = all in the consolidation phase
     now_ns = consolidation_end_ns + 15 * NS
-    sig = check_r6_local_breakout(st, now_ns, rank_60s=4, ret_24h=0.10, spread_bps=5.0)
+    sig = check_r6_local_breakout(st, now_ns, rank_60s=4, ret_24h=0.16, spread_bps=5.0)  # R6_RET_24H_MIN=0.15
     assert sig is not None, "R6 should fire on a clear breakout with volume"
     assert sig.features["breakout_pct"] > 0.004
 
