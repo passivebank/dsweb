@@ -5,6 +5,7 @@ Non-blocking: all REST calls run in a background daemon thread via a queue.
 on_signal() and on_price() return instantly — never block the asyncio loop.
 """
 import json
+import math
 import os
 import time
 import uuid
@@ -113,34 +114,77 @@ def _market_buy(client, coin: str, usd_amount: float) -> Optional[str]:
     return None
 
 
-def _market_sell(client, coin: str, base_qty: float, reason: str) -> Optional[str]:
-    """Attempt sell, retrying with fewer decimal places on INVALID_SIZE_PRECISION."""
-    for decimals in (8, 4, 2, 1, 0):
-        cid = str(uuid.uuid4())
-        qty_str = f"{base_qty:.{decimals}f}"
-        try:
-            resp = client.create_order(
-                client_order_id=cid,
-                product_id=f"{coin}-USD",
-                side="SELL",
-                order_configuration={"market_market_ioc": {"base_size": qty_str}},
-            )
-            if resp.success:
-                oid = resp.success_response["order_id"]
-                log.info(f"[SELL] {coin}  qty={qty_str}  reason={reason}  oid={oid}")
-                return oid
-            err = resp.error_response or {}
-            err_code = err.get("error", "") if isinstance(err, dict) else str(err)
-            if "PRECISION" in err_code or "INVALID_SIZE" in err_code:
-                log.warning(f"[SELL] {coin} precision retry: {decimals}dp → {err_code}")
+def _get_coin_balance(client, coin: str) -> float:
+    """Return available balance for a coin from Coinbase. Returns 0.0 on error."""
+    try:
+        resp = client.get_accounts(limit=250)
+        for acc in resp.accounts:
+            try:
+                cur = acc.currency if hasattr(acc, "currency") else ""
+                if cur != coin:
+                    continue
+                ab = acc.available_balance
+                return float(ab["value"] if isinstance(ab, dict) else ab.value)
+            except Exception:
                 continue
-            log.error(f"[SELL REJECT] {coin}: {resp.error_response}")
-            return None
-        except Exception as e:
-            log.error(f"[SELL ERR] {coin}: {e}")
-            return None
-    log.error(f"[SELL FAIL] {coin}: exhausted all precision retries for qty={base_qty}")
-    return None
+    except Exception as e:
+        log.error(f"[BAL ERR] {coin}: {e}")
+    return 0.0
+
+
+def _market_sell(client, coin: str, base_qty: float, reason: str) -> Optional[str]:
+    """Attempt sell, retrying with fewer decimal places on INVALID_SIZE_PRECISION.
+
+    Uses floor (not round) at each precision level so we never overshoot.
+    On INSUFFICIENT_FUND, fetches the actual Coinbase balance and retries —
+    the reconciler's qty estimate can drift from the real fill due to fees/
+    slippage, causing the bot to request more than it holds.
+    """
+    def _attempt(qty: float) -> Optional[str]:
+        for decimals in (8, 4, 2, 1, 0):
+            factor = 10 ** decimals
+            floored = math.floor(qty * factor) / factor
+            if floored <= 0:
+                continue
+            cid = str(uuid.uuid4())
+            qty_str = f"{floored:.{decimals}f}"
+            try:
+                resp = client.create_order(
+                    client_order_id=cid,
+                    product_id=f"{coin}-USD",
+                    side="SELL",
+                    order_configuration={"market_market_ioc": {"base_size": qty_str}},
+                )
+                if resp.success:
+                    oid = resp.success_response["order_id"]
+                    log.info(f"[SELL] {coin}  qty={qty_str}  reason={reason}  oid={oid}")
+                    return oid
+                err = resp.error_response or {}
+                err_code = err.get("error", "") if isinstance(err, dict) else str(err)
+                if "PRECISION" in err_code or "INVALID_SIZE" in err_code:
+                    log.warning(f"[SELL] {coin} precision retry: {decimals}dp → {err_code}")
+                    continue
+                if "INSUFFICIENT_FUND" in err_code:
+                    return "INSUFFICIENT_FUND"
+                log.error(f"[SELL REJECT] {coin}: {resp.error_response}")
+                return None
+            except Exception as e:
+                log.error(f"[SELL ERR] {coin}: {e}")
+                return None
+        return None
+
+    result = _attempt(base_qty)
+    if result == "INSUFFICIENT_FUND":
+        # Bot's qty estimate is higher than actual balance — fetch real balance and retry
+        real_qty = _get_coin_balance(client, coin)
+        log.warning(f"[SELL] {coin} INSUFFICIENT_FUND — fetched real balance: {real_qty} (bot had {base_qty:.6f})")
+        if real_qty > 0:
+            result = _attempt(real_qty)
+            if result and result != "INSUFFICIENT_FUND":
+                return result
+        log.error(f"[SELL REJECT] {coin}: INSUFFICIENT_FUND even with real balance {real_qty}")
+        return None
+    return result
 
 
 class LiveExecutor:
