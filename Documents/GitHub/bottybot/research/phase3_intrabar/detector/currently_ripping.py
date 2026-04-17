@@ -341,16 +341,16 @@ R5_TOP_K_RANK    = 10
 # Tier A has the best risk-adjusted return: huge b-ratio (6.25x), tiny avg loss (-1.6%).
 # Tier B has highest WR but larger losses (-5.8%) pull Kelly below Tier A.
 #
-# LIVE RECALIBRATION 2026-04-17 (134 live shadow trades, 4.8 days):
-#   Backtest WR/EV diverged significantly from live — signal fires 109x/day vs 0.69
-#   backtest (reduced selectivity in bull market). Live-derived half-Kelly sizing:
-#   A: WR=10% adj_EV=-4.1%  → 5%  (net loser — de minimis until re-validated)
-#   B: WR=23% adj_EV=-2.8%  → 5%  (net loser — de minimis until re-validated)
-#   C: WR=57% adj_EV=+3.2%  → 21% (only profitable tier — hold sizing)
-#   D: WR=41% adj_EV=-1.1%  → 5%  (marginally losing — de minimis)
-#   At ~$195 balance, 5% = $9.75 which is below MIN_ORDER_USD ($10) → A/B/D skip.
-#   Revisit when: 50+ trades per tier OR market regime returns to backtest conditions.
-R5_TIER_POS = {'A': 0.05, 'B': 0.05, 'C': 0.21, 'D': 0.05}
+# 2026-04-17 REVERT: shadow-based recalibration was misleading — shadow trades include
+#   far more signal fires than actually execute (many hit $10 minimum filter, cooldowns,
+#   CVD/onset gates). Actual live trade analysis (22 completed trades) shows all tiers
+#   have positive adj_EV when execution bugs are excluded:
+#   B: 5 trades, 60% WR, avg_win +18%, avg_loss -5.8%, adj_EV +8.5%
+#   D: 15 trades (excl. 2 bleed trades now fixed), 69% WR, adj_EV +9.6%
+#   C: 2 trades, 100% WR, adj_EV +9.7%
+#   The two -15% losses (EUL, SUP) were a reconciler bug (timer reset on restart),
+#   not signal failures. That bug is now fixed. Restoring backtest half-Kelly sizes.
+R5_TIER_POS = {'A': 0.40, 'B': 0.35, 'C': 0.25, 'D': 0.20}
 
 
 def check_r5_confirmed_run(state: CoinState, now_ns: int,
