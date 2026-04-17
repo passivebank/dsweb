@@ -889,22 +889,57 @@ class TestTradingLogicUnchanged:
             mock_buy.assert_not_called()
 
     def test_extreme_fear_skips_ab_tiers(self, tmp_path):
-        """Tier A/B signals with F&G < 25 must be skipped."""
+        """Tier A/B skipped only in true panic: F&G < 15 AND btc_ret_1h <= 2%.
+        F&G threshold lowered from 25→15; stale daily index cannot capture
+        intraday sentiment reversals, so the bar for skipping is now higher."""
         client = MagicMock()
         client.get_accounts.return_value = _make_accounts_response(
             _make_account("USD", 200.0)
         )
         ex = _make_executor(tmp_path, client)
 
+        # True panic: F&G=10, BTC flat → must skip
         for tier in ("A", "B"):
             sig = FakeSignal(coin="FEAR", sig_mid=1.0, features={
                 **FakeSignal().features,
                 "confidence_tier": tier,
-                "fear_greed": 20,
+                "fear_greed": 10,
+                "btc_ret_1h": 0.0,
             })
             with patch.object(le, "_market_buy") as mock_buy:
                 ex._handle_entry(sig)
-                mock_buy.assert_not_called(), f"Tier {tier} in extreme fear must not buy"
+                mock_buy.assert_not_called(), f"Tier {tier} true panic must not buy"
+
+        # F&G=21 (old threshold, today's market) — must NOT skip anymore
+        with ex._balance_lock:
+            ex._usd_cache = 200.0
+            ex._usd_cache_ts = time.time()
+        for tier in ("A", "B"):
+            sig = FakeSignal(coin="FEAR", sig_mid=1.0, features={
+                **FakeSignal().features,
+                "confidence_tier": tier,
+                "fear_greed": 21,
+                "btc_ret_1h": 0.0,
+            })
+            with patch.object(le, "_market_buy") as mock_buy:
+                mock_buy.return_value = f"oid-{tier}"
+                client.get_order.return_value = _make_fill_response(f"oid-{tier}", 1.0, 1.0)
+                ex._do_entry(sig, "FEAR", 1.0, tier, 0.20)
+                mock_buy.assert_called_once(), f"Tier {tier} F&G=21 must NOT be skipped"
+
+        # F&G=10 but BTC recovering +3% → override, must NOT skip
+        for tier in ("A", "B"):
+            sig = FakeSignal(coin="FEAR", sig_mid=1.0, features={
+                **FakeSignal().features,
+                "confidence_tier": tier,
+                "fear_greed": 10,
+                "btc_ret_1h": 0.03,
+            })
+            with patch.object(le, "_market_buy") as mock_buy:
+                mock_buy.return_value = f"oid-btcov-{tier}"
+                client.get_order.return_value = _make_fill_response(f"oid-btcov-{tier}", 1.0, 1.0)
+                ex._do_entry(sig, "FEAR", 1.0, tier, 0.20)
+                mock_buy.assert_called_once(), f"Tier {tier} BTC recovering must override fear gate"
 
     def test_cvd_gate_skips_net_selling(self, tmp_path):
         """CVD below GATE_CVD_30S_MIN must be skipped."""

@@ -464,10 +464,18 @@ class LiveExecutor:
         fear_greed = sig.features.get("fear_greed", 50)
 
         # Tier A/B are consolidation patterns (r5m 0.5-1%).
-        # In extreme fear they reverse immediately — 0/7 live, -7% adj_EV.
-        # Skip until F&G recovers above 25.
-        if tier in ("A", "B") and fear_greed < 25:
-            log.info(f"[SKIP] {coin} Tier={tier} F&G={fear_greed} — extreme fear, consolidation skip")
+        # Skip only in true panic: F&G < 15 AND BTC not recovering intraday.
+        # Threshold lowered from 25→15: F&G=21 is "nervous", not panic.
+        # F&G updates once/day at midnight UTC — it cannot capture intraday
+        # sentiment reversals (macro catalysts, BTC recovery legs, etc.).
+        # Override: if BTC is up >2% in the last hour, market has turned
+        # risk-on regardless of the stale daily index.
+        btc_ret_1h = sig.features.get("btc_ret_1h", 0.0)
+        if tier in ("A", "B") and fear_greed < 15 and btc_ret_1h <= 0.02:
+            log.info(
+                f"[SKIP] {coin} Tier={tier} F&G={fear_greed} btc_1h={btc_ret_1h:+.1%}"
+                f" — true panic, consolidation skip"
+            )
             return
 
         cvd_30s = sig.features.get("cvd_30s", 0.0)
