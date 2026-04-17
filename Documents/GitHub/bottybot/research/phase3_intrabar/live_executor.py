@@ -33,7 +33,8 @@ MIN_ORDER_USD   = 5.0
 MAX_HOLD_S      = 14400   # 4h hard cap
 
 # ── v10 entry filter gates ───────────────────────────────────────────
-GATE_ONSET_S = 15.0  # skip if 15+ seconds since the move started (late entry)
+GATE_ONSET_S    = 15.0   # skip if 15+ seconds since the move started (late entry)
+GATE_CVD_30S_MIN = -2000  # skip if net selling > $2000 in last 30s (18% WR vs 46%)
 
 # Per-coin cooldown after exit: prevents re-entry on a coin that just reversed.
 # Keyed on exit classification; elapsed time must exceed cooldown before re-entry.
@@ -265,6 +266,11 @@ class LiveExecutor:
         # Skip until F&G recovers above 25.
         if tier in ("A", "B") and fear_greed < 25:
             log.info(f"[SKIP] {coin} Tier={tier} F&G={fear_greed} — extreme fear, consolidation skip")
+            return
+
+        cvd_30s = sig.features.get("cvd_30s", 0.0)
+        if cvd_30s < GATE_CVD_30S_MIN:
+            log.info(f"[SKIP] {coin} cvd_30s={cvd_30s:.0f} < {GATE_CVD_30S_MIN} — net selling pressure")
             return
 
         secs_onset = sig.features.get("secs_since_onset", 0.0)
