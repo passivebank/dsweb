@@ -200,14 +200,14 @@ class LiveExecutor:
 
             if hold_s >= MAX_HOLD_S:
                 self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
-                del self._positions[coin]
+                del self._positions[coin]   # worker restores if sell fails
             elif not pos["half_sold"] and gain >= PARTIAL_TRIGGER:
                 pos["half_sold"] = True
                 pos["qty"] *= 0.5
                 self._q.put(("partial", coin, pos.copy(), price))
             elif price <= stop_px:
                 self._q.put(("sell", coin, pos.copy(), price, "TRAIL_STOP"))
-                del self._positions[coin]
+                del self._positions[coin]   # worker restores if sell fails
 
     # ── background worker — all REST calls happen here ───────────────
 
@@ -246,7 +246,15 @@ class LiveExecutor:
 
                 elif cmd == "sell":
                     _, coin, pos, price, reason = item
-                    _market_sell(self._client, coin, pos["qty"], reason)
+                    oid = _market_sell(self._client, coin, pos["qty"], reason)
+                    if oid is None:
+                        # Sell failed — restore position so on_price keeps managing it
+                        # and will enqueue another sell attempt on the next price tick.
+                        with self._lock:
+                            if coin not in self._positions:
+                                self._positions[coin] = pos
+                        log.error(f"[SELL FAIL] {coin} — position RESTORED, will retry on next tick")
+                        continue
                     gain = price / pos["entry_px"] - 1.0
                     hold_min = (time.time() - pos["entry_ts"]) / 60.0
                     log.info(f"[EXIT] {coin} {reason} gain={gain:+.1%} held={hold_min:.1f}m Tier={pos['tier']}")
