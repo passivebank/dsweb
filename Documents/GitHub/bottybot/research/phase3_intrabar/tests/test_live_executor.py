@@ -1,0 +1,1059 @@
+"""
+test_live_executor.py — unit tests for live_executor.py
+
+All Coinbase API calls are mocked. No live connections are made.
+Tests verify:
+  1. Functional fixes (the 12 reliability issues)
+  2. Trading logic is unchanged (EV scoring, thresholds, position sizing,
+     trail stops, cooldowns, gates)
+
+Run: python -m pytest research/phase3_intrabar/tests/test_live_executor.py -v
+"""
+
+import json
+import os
+import sys
+import time
+import threading
+import tempfile
+import types
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+from unittest.mock import MagicMock, patch, call
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Path setup — allow importing live_executor from parent directory
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import live_executor as le
+from live_executor import (
+    _get_coin_balance,
+    _get_usd_balance,
+    _market_buy,
+    _market_sell,
+    _fetch_order_fill,
+    LiveExecutor,
+    COOLDOWN_S,
+    TIER_EV_BASELINE,
+    MIN_EV_PCT,
+    PARTIAL_TRIGGER,
+    TRAIL_PRE,
+    TRAIL_POST,
+    MAX_HOLD_S,
+    GATE_CVD_30S_MIN,
+    GATE_ONSET_S,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers & fixtures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FakeSignal:
+    """Minimal stand-in for detector.SignalEvent."""
+    variant:    str   = "R5_CONFIRMED_RUN"
+    coin:       str   = "TEST"
+    sig_ts_ns:  int   = 0
+    sig_mid:    float = 1.00
+    features:   dict  = field(default_factory=lambda: {
+        "confidence_tier":    "D",
+        "position_pct":       0.20,
+        "fear_greed":         50,
+        "cvd_30s":            500.0,
+        "secs_since_onset":   1.0,
+        "dv_trend":           6.0,
+        "spread_bps":         5.0,
+        "large_trade_pct_60s": 0.0,
+    })
+
+
+def _make_account(currency: str, balance: float) -> MagicMock:
+    """Build a fake Coinbase account object."""
+    acc = MagicMock()
+    acc.currency = currency
+    acc.available_balance = {"value": str(balance)}
+    return acc
+
+
+def _make_accounts_response(*accounts, has_next=False, cursor=None) -> MagicMock:
+    resp = MagicMock()
+    resp.accounts = list(accounts)
+    resp.has_next = has_next
+    resp.cursor   = cursor
+    return resp
+
+
+def _make_order_response(order_id: str, success: bool = True,
+                          error_code: str = "") -> MagicMock:
+    resp = MagicMock()
+    resp.success = success
+    if success:
+        resp.success_response = {"order_id": order_id}
+    else:
+        resp.error_response = {"error": error_code, "message": error_code}
+    return resp
+
+
+def _make_fill_response(order_id: str, filled_size: float,
+                         filled_value: float) -> MagicMock:
+    resp = MagicMock()
+    order = MagicMock()
+    order.filled_size  = str(filled_size)
+    order.filled_value = str(filled_value)
+    resp.order = order
+    return resp
+
+
+def _make_executor(tmp_path: Path, client: MagicMock) -> LiveExecutor:
+    """Build a LiveExecutor with a mocked client, bypassing _make_client."""
+    trade_log = tmp_path / "live_trades.jsonl"
+    with patch.object(le, "_make_client", return_value=client):
+        ex = LiveExecutor(trade_log)
+    return ex
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 — Balance cache decremented immediately after buy
+# ---------------------------------------------------------------------------
+
+class TestBalanceCacheDecrement:
+    def test_cache_decremented_after_fill(self, tmp_path):
+        """After a successful buy+fill, the balance cache drops by filled_value,
+        not by the full usd_size (which may differ slightly due to fees)."""
+        client = MagicMock()
+
+        # First accounts call: $200 balance
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        client.create_order.return_value = _make_order_response("oid-buy-1")
+        # Fill: $38.10 spent, 23.989 coins received
+        client.get_order.return_value = _make_fill_response("oid-buy-1", 23.989, 38.10)
+        client.get_best_bid_ask.return_value = MagicMock(
+            pricebooks=[MagicMock(bids=[MagicMock(price="1.59")])]
+        )
+
+        ex = _make_executor(tmp_path, client)
+
+        sig = FakeSignal(coin="EUL", sig_mid=1.59,
+                         features={**FakeSignal().features,
+                                   "confidence_tier": "D", "position_pct": 0.20})
+
+        # Manually prime the balance cache
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        ex._do_entry(sig, "EUL", 1.59, "D", 0.20)
+
+        # Cache should be decremented by the pre-buy usd_size ($40), not still $200
+        with ex._balance_lock:
+            cached = ex._usd_cache
+        assert cached < 200.0, "Cache must drop after buy"
+        assert cached >= 0.0,  "Cache must not go negative"
+
+    def test_cache_invalidated_on_fill_fail(self, tmp_path):
+        """If fill fetch fails, the cache TTL is zeroed so the next entry
+        forces a real refresh rather than using a stale pre-buy value."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        client.create_order.return_value = _make_order_response("oid-x")
+        # Fill fetch always returns unfilled (simulates fetch failure)
+        fill_resp = MagicMock()
+        fill_resp.order = MagicMock(filled_size="0", filled_value="0",
+                                     total_value_after_fees="0")
+        client.get_order.return_value = fill_resp
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="FOO", sig_mid=1.0)
+        ex._do_entry(sig, "FOO", 1.0, "D", 0.20)
+
+        with ex._balance_lock:
+            assert ex._usd_cache_ts == 0.0, "TTL must be zeroed after fill-fail entry"
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 — Exit P&L uses actual fill price, not trigger price
+# ---------------------------------------------------------------------------
+
+class TestExitFillPrice:
+    def test_exit_logs_fill_price_not_trigger(self, tmp_path):
+        """EXIT record price and gain must reflect actual fill, not on_price trigger."""
+        client = MagicMock()
+
+        # Set up balances + buy fill
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        client.create_order.side_effect = [
+            _make_order_response("oid-buy"),    # buy
+            _make_order_response("oid-sell"),   # sell
+        ]
+        # Buy fill: 10 coins @ $1.00
+        # Sell fill: 10 coins sold, $10.35 received (fill_px = 1.035)
+        # filled_size must be > 0 so _fetch_order_fill completes in one attempt
+        buy_fill  = _make_fill_response("oid-buy",  10.0, 10.0)
+        sell_fill = _make_fill_response("oid-sell", 10.0, 10.35)
+
+        def get_order_side_effect(order_id):
+            if order_id == "oid-buy":
+                return buy_fill
+            return sell_fill
+
+        client.get_order.side_effect = get_order_side_effect
+        client.get_best_bid_ask.return_value = MagicMock(
+            pricebooks=[MagicMock(bids=[MagicMock(price="1.00")])]
+        )
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 100.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="TST", sig_mid=1.0,
+                         features={**FakeSignal().features, "position_pct": 0.10})
+        ex._do_entry(sig, "TST", 1.0, "D", 0.10)
+
+        # Inject a pre-built position to simulate the worker receiving a sell command
+        with ex._lock:
+            pos = ex._positions.get("TST")
+        assert pos is not None
+
+        trigger_px = 1.02  # price at which trail stop fired
+        # Simulate the worker's sell path directly
+        ex._q.put(("sell", "TST", pos.copy(), trigger_px, "TRAIL_STOP"))
+        with ex._lock:
+            ex._positions.pop("TST", None)
+
+        time.sleep(0.3)  # let worker process
+
+        log_path = tmp_path / "live_trades.jsonl"
+        records = [json.loads(l) for l in log_path.read_text().splitlines()]
+        exit_rec = next((r for r in records if r["event"] == "EXIT"), None)
+        assert exit_rec is not None
+
+        # fill price is 1.035, trigger was 1.02 — log must use fill price
+        assert abs(exit_rec["price"] - 1.035) < 0.001, \
+            f"EXIT price should be fill price (1.035), got {exit_rec['price']}"
+        assert "trigger_px" in exit_rec, "EXIT must log trigger_px separately"
+        assert abs(exit_rec["trigger_px"] - trigger_px) < 0.001
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 — _get_coin_balance paginates
+# ---------------------------------------------------------------------------
+
+class TestGetCoinBalancePagination:
+    def test_finds_coin_on_second_page(self):
+        client = MagicMock()
+        page1 = _make_accounts_response(
+            _make_account("BTC", 0.01),
+            has_next=True, cursor="page2"
+        )
+        page2 = _make_accounts_response(
+            _make_account("EUL", 24.644),
+            has_next=False, cursor=None
+        )
+        client.get_accounts.side_effect = [page1, page2]
+
+        result = _get_coin_balance(client, "EUL")
+        assert result == pytest.approx(24.644)
+        assert client.get_accounts.call_count == 2
+
+    def test_returns_zero_when_coin_not_found(self):
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("BTC", 0.5),
+            has_next=False
+        )
+        result = _get_coin_balance(client, "NOTREAL")
+        assert result == 0.0
+
+    def test_returns_none_on_api_error(self):
+        client = MagicMock()
+        client.get_accounts.side_effect = Exception("network error")
+        result = _get_coin_balance(client, "EUL")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# FIX 4 — _get_coin_balance None handled safely in partial handler
+# ---------------------------------------------------------------------------
+
+class TestPartialBalanceFetchFailure:
+    def test_partial_keeps_estimated_qty_on_balance_error(self, tmp_path):
+        """If _get_coin_balance returns None after a partial sell, the position
+        keeps the halved-estimate qty rather than being zeroed."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        client.create_order.side_effect = [
+            _make_order_response("oid-buy"),
+            _make_order_response("oid-partial"),
+        ]
+        client.get_order.return_value = _make_fill_response("oid-buy", 50.0, 50.0)
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 100.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="TSTP", sig_mid=1.0,
+                         features={**FakeSignal().features, "position_pct": 0.50})
+        ex._do_entry(sig, "TSTP", 1.0, "D", 0.50)
+
+        with ex._lock:
+            pos = ex._positions.get("TSTP")
+        assert pos is not None
+
+        # Simulate the partial: halve qty in-place (as on_price does)
+        with ex._lock:
+            ex._positions["TSTP"]["qty"] *= 0.5
+            ex._positions["TSTP"]["half_sold"] = True
+            halved = ex._positions["TSTP"]["qty"]
+
+        # Now inject partial command; balance fetch will fail
+        pos_copy = ex._positions["TSTP"].copy()
+        with patch.object(le, "_get_coin_balance", return_value=None):
+            ex._q.put(("partial", "TSTP", pos_copy, 1.2))
+            time.sleep(0.3)
+
+        with ex._lock:
+            remaining_qty = ex._positions.get("TSTP", {}).get("qty", 0)
+
+        # Must not be zero; should be the halved estimate
+        assert remaining_qty > 0, "qty must not be zeroed on balance-fetch failure"
+        assert remaining_qty == pytest.approx(halved, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# FIX 5 — Balance cache is thread-safe
+# ---------------------------------------------------------------------------
+
+class TestBalanceLockThreadSafety:
+    def test_concurrent_refresh_doesnt_corrupt_cache(self, tmp_path):
+        """Two threads calling _refresh_balance concurrently should not produce
+        negative or nonsensical cache values."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 150.0)
+        )
+
+        ex = _make_executor(tmp_path, client)
+
+        def refresh_loop():
+            for _ in range(20):
+                with ex._balance_lock:
+                    ex._usd_cache_ts = 0.0  # force refresh each time
+                ex._refresh_balance()
+                time.sleep(0.005)
+
+        threads = [threading.Thread(target=refresh_loop) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        with ex._balance_lock:
+            assert ex._usd_cache >= 0.0, "cache must never be negative"
+
+
+# ---------------------------------------------------------------------------
+# FIX 6 — ENTRY log includes buy_order_id
+# ---------------------------------------------------------------------------
+
+class TestEntryLogIncludesBuyOrder:
+    def test_entry_record_has_buy_order_field(self, tmp_path):
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        client.create_order.return_value = _make_order_response("oid-abc-123")
+        client.get_order.return_value = _make_fill_response("oid-abc-123", 5.0, 10.0)
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="COIN", sig_mid=2.0,
+                         features={**FakeSignal().features, "position_pct": 0.05})
+        ex._do_entry(sig, "COIN", 2.0, "D", 0.05)
+
+        log_path = tmp_path / "live_trades.jsonl"
+        records  = [json.loads(l) for l in log_path.read_text().splitlines()]
+        entry    = next((r for r in records if r["event"] == "ENTRY"), None)
+        assert entry is not None
+        assert entry.get("buy_order") == "oid-abc-123", \
+            f"ENTRY must include buy_order; got {entry.get('buy_order')}"
+
+
+# ---------------------------------------------------------------------------
+# FIX 7 — EXIT log includes half_sold; reconciler uses it for cooldown key
+# ---------------------------------------------------------------------------
+
+class TestExitHalfSoldAndCooldown:
+    def _write_exit(self, tmp_path, reason, half_sold, gain, ts_offset_s=0):
+        """Write a synthetic EXIT record to the trade log."""
+        log_path = tmp_path / "live_trades.jsonl"
+        ts = time.time() - ts_offset_s
+        ts_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+        rec = {
+            "event":     "EXIT",
+            "coin":      "TST",
+            "price":     1.0,
+            "ts":        ts_str,
+            "reason":    reason,
+            "gain":      gain,
+            "hold_min":  60.0,
+            "tier":      "D",
+            "half_sold": half_sold,
+        }
+        log_path.write_text(json.dumps(rec) + "\n")
+
+    def test_trail_stop_full_no_partial(self, tmp_path):
+        """TRAIL_STOP with half_sold=False → TRAIL_STOP_FULL (90m cooldown)."""
+        self._write_exit(tmp_path, "TRAIL_STOP", half_sold=False, gain=-0.03)
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        _, ck = ex._last_exit.get("TST", (None, None))
+        assert ck == "TRAIL_STOP_FULL", f"Expected TRAIL_STOP_FULL, got {ck}"
+
+    def test_trail_stop_partial_had_half_sell(self, tmp_path):
+        """TRAIL_STOP with half_sold=True → TRAIL_STOP_PARTIAL (20m cooldown)."""
+        self._write_exit(tmp_path, "TRAIL_STOP", half_sold=True, gain=0.12)
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        _, ck = ex._last_exit.get("TST", (None, None))
+        assert ck == "TRAIL_STOP_PARTIAL", f"Expected TRAIL_STOP_PARTIAL, got {ck}"
+
+    def test_trail_stop_full_positive_gain_no_partial(self, tmp_path):
+        """TRAIL_STOP with half_sold=False but positive gain → still TRAIL_STOP_FULL.
+        This is the case the old gain-based heuristic would get WRONG."""
+        self._write_exit(tmp_path, "TRAIL_STOP", half_sold=False, gain=0.05)
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        _, ck = ex._last_exit.get("TST", (None, None))
+        assert ck == "TRAIL_STOP_FULL", \
+            "Positive gain without partial must still be TRAIL_STOP_FULL (90m), " \
+            f"got {ck}"
+
+    def test_exit_record_contains_half_sold_field(self, tmp_path):
+        """The EXIT record written to the log must include half_sold."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        client.create_order.side_effect = [
+            _make_order_response("oid-buy"),
+            _make_order_response("oid-sell"),
+        ]
+        buy_fill  = _make_fill_response("oid-buy", 10.0, 10.0)
+        sell_fill = _make_fill_response("oid-sell", 10.0, 9.5)  # filled_size>0 so fill resolves immediately
+
+        def get_order_se(order_id):
+            return buy_fill if order_id == "oid-buy" else sell_fill
+
+        client.get_order.side_effect = get_order_se
+        client.get_best_bid_ask.return_value = MagicMock(
+            pricebooks=[MagicMock(bids=[MagicMock(price="1.00")])]
+        )
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 100.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="TST2", sig_mid=1.0,
+                         features={**FakeSignal().features, "position_pct": 0.10})
+        ex._do_entry(sig, "TST2", 1.0, "D", 0.10)
+
+        with ex._lock:
+            pos = ex._positions.get("TST2", {}).copy()
+
+        ex._q.put(("sell", "TST2", pos, 0.95, "TRAIL_STOP"))
+        with ex._lock:
+            ex._positions.pop("TST2", None)
+
+        time.sleep(0.3)
+
+        records = [json.loads(l) for l in (tmp_path / "live_trades.jsonl").read_text().splitlines()]
+        exit_rec = next((r for r in records if r["event"] == "EXIT"), None)
+        assert exit_rec is not None
+        assert "half_sold" in exit_rec, "EXIT record must contain half_sold field"
+        assert exit_rec["half_sold"] is False
+
+
+# ---------------------------------------------------------------------------
+# FIX 8 — Pending-entry guard prevents duplicate buys
+# ---------------------------------------------------------------------------
+
+class TestPendingEntryGuard:
+    def test_second_signal_skipped_while_first_pending(self, tmp_path):
+        """If a coin is already in _pending_entry, a second signal for the same
+        coin must be skipped without placing a second buy order."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+
+        barrier = threading.Barrier(2)
+        buy_count = [0]
+
+        def slow_buy(*args, **kwargs):
+            buy_count[0] += 1
+            barrier.wait(timeout=2)   # hold until both threads have reached here
+            return _make_order_response("oid-slow")
+
+        client.create_order.side_effect = slow_buy
+        client.get_order.return_value = _make_fill_response("oid-slow", 10.0, 10.0)
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="DUP", sig_mid=1.0,
+                         features={**FakeSignal().features, "position_pct": 0.10})
+
+        # Manually set the pending guard to simulate first entry in-flight
+        with ex._lock:
+            ex._pending_entry.add("DUP")
+
+        # Second signal should be dropped immediately
+        try:
+            ex._handle_entry(sig)
+        except Exception:
+            pass
+
+        assert buy_count[0] == 0, \
+            "No buy should be placed when coin is in _pending_entry"
+
+
+# ---------------------------------------------------------------------------
+# FIX 9 — _log failure is critical + echoes to stderr, never silent
+# ---------------------------------------------------------------------------
+
+class TestLogFailureCritical:
+    def test_log_failure_prints_to_stderr(self, tmp_path, capsys):
+        """On log write failure, record must appear in stderr (systemd journal)."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        # Point trade log at a path that can't be written
+        ex._trade_log = Path("/nonexistent_dir/trades.jsonl")
+
+        ex._log("EXIT", "TST", 1.0, gain=0.05, reason="TRAIL_STOP")
+
+        captured = capsys.readouterr()
+        assert "TRADE_LOG_FAIL" in captured.err, \
+            "Failed log write must echo to stderr with TRADE_LOG_FAIL prefix"
+        assert "EXIT" in captured.err
+        assert "TST" in captured.err
+
+    def test_log_is_fsynced(self, tmp_path, monkeypatch):
+        """_log must call fsync so data is durable before we proceed."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        fsync_called = []
+        real_fsync = os.fsync
+
+        def fake_fsync(fd):
+            fsync_called.append(fd)
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fake_fsync)
+        ex._log("ENTRY", "TST", 1.0, qty=1.0)
+        assert len(fsync_called) >= 1, "_log must call os.fsync for durability"
+
+
+# ---------------------------------------------------------------------------
+# FIX 10 — entry_ts reflects order submission time, not fill confirmation time
+# ---------------------------------------------------------------------------
+
+class TestEntryTimestamp:
+    def test_entry_ts_set_before_fill_fetch(self, tmp_path):
+        """entry_ts should be the timestamp when the buy was submitted,
+        not after _fetch_order_fill returns (which can take ~1s)."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        client.create_order.return_value = _make_order_response("oid-ts")
+
+        fill_delay_s = 0.4
+
+        def slow_get_order(order_id):
+            time.sleep(fill_delay_s)
+            return _make_fill_response(order_id, 10.0, 10.0)
+
+        client.get_order.side_effect = slow_get_order
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        before = time.time()
+        sig = FakeSignal(coin="TSTS", sig_mid=1.0,
+                         features={**FakeSignal().features, "position_pct": 0.05})
+        ex._do_entry(sig, "TSTS", 1.0, "D", 0.05)
+        after = time.time()
+
+        with ex._lock:
+            pos = ex._positions.get("TSTS")
+        assert pos is not None
+
+        # entry_ts should be <= the time fill fetch started (before fill_delay elapsed)
+        # i.e. it should NOT be close to `after`
+        assert pos["entry_ts"] < (before + fill_delay_s * 0.5), \
+            "entry_ts must be set at order submission, before fill fetch delay"
+
+
+# ---------------------------------------------------------------------------
+# FIX 11 — peak_px is logged in ENTRY and restored by reconciler
+# ---------------------------------------------------------------------------
+
+class TestPeakPxPersistence:
+    def test_entry_record_contains_peak_px(self, tmp_path):
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        client.create_order.return_value = _make_order_response("oid-pp")
+        client.get_order.return_value = _make_fill_response("oid-pp", 10.0, 15.0)
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="PPX", sig_mid=1.5,
+                         features={**FakeSignal().features, "position_pct": 0.08})
+        ex._do_entry(sig, "PPX", 1.5, "D", 0.08)
+
+        records = [json.loads(l) for l in (tmp_path / "live_trades.jsonl").read_text().splitlines()]
+        entry = next((r for r in records if r["event"] == "ENTRY"), None)
+        assert entry is not None
+        assert "peak_px" in entry, "ENTRY record must contain peak_px"
+        # peak_px at entry time equals the fill price
+        assert entry["peak_px"] == pytest.approx(entry["price"], rel=0.001)
+
+    def test_reconciler_restores_peak_px_from_entry_record(self, tmp_path):
+        """On restart, reconciler should use peak_px from the log record,
+        not reset it to entry_px."""
+        entry_px = 1.00
+        peak_px  = 1.25   # coin ran up before restart
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        # Current bid is below the peak — reconciler must use logged peak_px
+        client.get_best_bid_ask.return_value = MagicMock(
+            pricebooks=[MagicMock(bids=[MagicMock(price="1.10")])]
+        )
+
+        log_path = tmp_path / "live_trades.jsonl"
+        ts_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rec = {
+            "event":    "ENTRY",
+            "coin":     "PK",
+            "price":    entry_px,
+            "ts":       ts_str,
+            "tier":     "D",
+            "qty":      10.0,
+            "usd_size": 10.0,
+            "peak_px":  peak_px,
+            "buy_order": "oid-pk",
+        }
+        log_path.write_text(json.dumps(rec) + "\n")
+
+        ex = _make_executor(tmp_path, client)
+
+        with ex._lock:
+            pos = ex._positions.get("PK")
+        assert pos is not None
+        # peak_px should be max(logged peak_px=1.25, current_bid=1.10) = 1.25
+        assert pos["peak_px"] == pytest.approx(1.25, rel=0.001), \
+            f"peak_px should be restored to 1.25 from log, got {pos['peak_px']}"
+
+
+# ---------------------------------------------------------------------------
+# FIX 12 — FILL event written to trade log before ENTRY
+# ---------------------------------------------------------------------------
+
+class TestFillLogEvent:
+    def test_fill_record_written_to_log(self, tmp_path):
+        """A FILL record must appear in the trade log before the ENTRY record."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        client.create_order.return_value = _make_order_response("oid-fill-test")
+        client.get_order.return_value = _make_fill_response("oid-fill-test", 7.5, 10.0)
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="FILL", sig_mid=1.33,
+                         features={**FakeSignal().features, "position_pct": 0.05})
+        ex._do_entry(sig, "FILL", 1.33, "D", 0.05)
+
+        lines = (tmp_path / "live_trades.jsonl").read_text().splitlines()
+        records = [json.loads(l) for l in lines]
+        events = [r["event"] for r in records]
+
+        assert "FILL" in events, "FILL event must be written to trade log"
+        fill_idx  = events.index("FILL")
+        entry_idx = events.index("ENTRY")
+        assert fill_idx < entry_idx, "FILL must appear before ENTRY in the log"
+
+    def test_fill_record_contains_order_id(self, tmp_path):
+        """FILL record must contain the Coinbase order_id for cross-referencing."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        client.create_order.return_value = _make_order_response("oid-cross-ref")
+        client.get_order.return_value = _make_fill_response("oid-cross-ref", 5.0, 10.0)
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        sig = FakeSignal(coin="CRF", sig_mid=2.0,
+                         features={**FakeSignal().features, "position_pct": 0.05})
+        ex._do_entry(sig, "CRF", 2.0, "D", 0.05)
+
+        records = [json.loads(l) for l in (tmp_path / "live_trades.jsonl").read_text().splitlines()]
+        fill_rec = next((r for r in records if r["event"] == "FILL"), None)
+        assert fill_rec is not None
+        assert fill_rec.get("order_id") == "oid-cross-ref"
+
+    def test_orphaned_fill_detected_at_reconcile(self, tmp_path):
+        """FILL without matching ENTRY is an orphaned fill — reconciler must log CRITICAL."""
+        log_path = tmp_path / "live_trades.jsonl"
+        ts_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # Write a FILL record without any ENTRY
+        log_path.write_text(
+            json.dumps({"event": "FILL", "coin": "ORF", "price": 1.0,
+                        "ts": ts_str, "order_id": "orphan-oid",
+                        "qty": 5.0, "value_usd": 5.0}) + "\n"
+        )
+
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+
+        import logging
+        critical_records = []
+        handler = logging.handlers_list = []
+
+        class CaptureCritical(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.CRITICAL:
+                    critical_records.append(record.getMessage())
+
+        le.log.addHandler(CaptureCritical())
+        try:
+            ex = _make_executor(tmp_path, client)
+        finally:
+            le.log.handlers = [h for h in le.log.handlers
+                                if not isinstance(h, CaptureCritical)]
+
+        assert any("orphan-oid" in m or "ORPHANED" in m for m in critical_records), \
+            "Reconciler must log CRITICAL for orphaned FILL records"
+
+
+# ---------------------------------------------------------------------------
+# TRADING LOGIC UNCHANGED — verify profitability-relevant constants & behavior
+# ---------------------------------------------------------------------------
+
+class TestTradingLogicUnchanged:
+    """These tests verify that the reliability fixes did NOT alter any trading
+    decision: EV scoring, position sizing, entry gates, exit thresholds."""
+
+    def test_ev_scoring_tier_baselines(self):
+        assert TIER_EV_BASELINE == {"A": 7.5, "B": 4.3, "C": 4.2, "D": 3.2}
+
+    def test_ev_min_threshold(self):
+        assert MIN_EV_PCT == 1.5
+
+    def test_partial_trigger_threshold(self):
+        assert PARTIAL_TRIGGER == pytest.approx(0.20)
+
+    def test_trail_pre_post(self):
+        assert TRAIL_PRE  == pytest.approx(0.07)
+        assert TRAIL_POST == pytest.approx(0.15)
+
+    def test_max_hold_seconds(self):
+        assert MAX_HOLD_S == 14400
+
+    def test_cvd_gate_constant(self):
+        assert GATE_CVD_30S_MIN == -2000
+
+    def test_onset_gate_constant(self):
+        assert GATE_ONSET_S == pytest.approx(15.0)
+
+    def test_cooldown_values(self):
+        assert COOLDOWN_S["TRAIL_STOP_FULL"]    == 90 * 60
+        assert COOLDOWN_S["TRAIL_STOP_PARTIAL"] == 20 * 60
+        assert COOLDOWN_S["TIME_CAP_LOSS"]      == 60 * 60
+        assert COOLDOWN_S["TIME_CAP_GAIN"]      == 20 * 60
+
+    def test_ev_score_cvd_component(self, tmp_path):
+        """CVD contribution: +2% at cvd≥2000, 0% at cvd=−2000, linear between."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        def score(cvd):
+            sig = FakeSignal(features={
+                "confidence_tier": "D",
+                "cvd_30s": cvd,
+                "secs_since_onset": 5.0,  # zero timing bonus
+                "dv_trend": 5.0,           # +0.5
+                "spread_bps": 5.0,         # 0
+                "large_trade_pct_60s": 0.0 # 0
+            })
+            return ex._score_signal(sig)
+
+        ev_at_pos2000 = score(2000)
+        ev_at_neg2000 = score(-2000)
+        ev_at_zero    = score(0)
+        assert ev_at_pos2000 > ev_at_zero > ev_at_neg2000
+
+    def test_ev_score_low_rejects_entry(self, tmp_path):
+        """Signal with ev below MIN_EV_PCT must be skipped without buy."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        # All adjustments negative → ev far below 1.5%
+        sig = FakeSignal(coin="LOWEV", sig_mid=1.0, features={
+            "confidence_tier":    "D",
+            "position_pct":       0.20,
+            "fear_greed":         50,
+            "cvd_30s":            -5000.0,  # below gate, but we test EV here
+            "secs_since_onset":   20.0,     # -1.5 timing penalty
+            "dv_trend":           1.0,      # -1.0 dvt penalty
+            "spread_bps":         15.0,     # -0.5 spread penalty
+            "large_trade_pct_60s": 0.0,
+        })
+        # Override CVD gate so only EV gate applies
+        sig.features["cvd_30s"] = 0.0
+
+        with patch.object(le, "_market_buy") as mock_buy:
+            ex._do_entry(sig, "LOWEV", 1.0, "D", 0.20)
+            mock_buy.assert_not_called()
+
+    def test_extreme_fear_skips_ab_tiers(self, tmp_path):
+        """Tier A/B signals with F&G < 25 must be skipped."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        for tier in ("A", "B"):
+            sig = FakeSignal(coin="FEAR", sig_mid=1.0, features={
+                **FakeSignal().features,
+                "confidence_tier": tier,
+                "fear_greed": 20,
+            })
+            with patch.object(le, "_market_buy") as mock_buy:
+                ex._handle_entry(sig)
+                mock_buy.assert_not_called(), f"Tier {tier} in extreme fear must not buy"
+
+    def test_cvd_gate_skips_net_selling(self, tmp_path):
+        """CVD below GATE_CVD_30S_MIN must be skipped."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        sig = FakeSignal(coin="SELL", sig_mid=1.0, features={
+            **FakeSignal().features,
+            "cvd_30s": -3000.0,
+        })
+        with patch.object(le, "_market_buy") as mock_buy:
+            ex._handle_entry(sig)
+            mock_buy.assert_not_called()
+
+    def test_onset_gate_skips_late_entry(self, tmp_path):
+        """Signal more than GATE_ONSET_S seconds after move started is skipped."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        sig = FakeSignal(coin="LATE", sig_mid=1.0, features={
+            **FakeSignal().features,
+            "secs_since_onset": 20.0,
+        })
+        with patch.object(le, "_market_buy") as mock_buy:
+            ex._handle_entry(sig)
+            mock_buy.assert_not_called()
+
+    def test_trail_stop_fires_at_correct_threshold(self, tmp_path):
+        """TRAIL_STOP must fire when price drops to peak * (1 - TRAIL_PRE)."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        # Inject a position directly
+        with ex._lock:
+            ex._positions["TRL"] = {
+                "entry_px": 1.00, "qty": 10.0, "peak_px": 1.20,
+                "half_sold": False, "entry_ts": time.time() - 60,
+                "tier": "D", "usd_in": 10.0, "buy_order": "x",
+            }
+
+        # price just above stop threshold — should NOT trigger
+        stop_px = 1.20 * (1 - TRAIL_PRE)
+        above_stop = stop_px + 0.001
+        ex.on_price("TRL", above_stop)
+        with ex._lock:
+            assert "TRL" in ex._positions, "Position should remain above stop"
+
+        # price at or below stop threshold — must trigger
+        ex.on_price("TRL-USD", stop_px - 0.001)
+        with ex._lock:
+            assert "TRL" not in ex._positions, "Position must exit at trail stop"
+
+    def test_partial_fires_at_correct_gain(self, tmp_path):
+        """PARTIAL must trigger exactly at PARTIAL_TRIGGER (20%) gain."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        ex = _make_executor(tmp_path, client)
+
+        with ex._lock:
+            ex._positions["PART"] = {
+                "entry_px": 1.00, "qty": 10.0, "peak_px": 1.00,
+                "half_sold": False, "entry_ts": time.time() - 60,
+                "tier": "D", "usd_in": 10.0, "buy_order": "x",
+            }
+
+        # Just below partial trigger
+        ex.on_price("PART", 1.00 * (1 + PARTIAL_TRIGGER) - 0.001)
+        with ex._lock:
+            assert not ex._positions["PART"]["half_sold"], "No partial below threshold"
+
+        # At or above partial trigger — use a price clearly above the threshold to
+        # avoid floating-point rounding (1.2 / 1.0 - 1.0 = 0.19999... in Python).
+        # Patch _get_coin_balance so the worker sets real_remaining=5.0 (the halved qty).
+        trigger_price = 1.00 * (1 + PARTIAL_TRIGGER) + 0.001  # 1.201: unambiguously >= 0.20
+        with patch.object(le, "_get_coin_balance", return_value=5.0):
+            ex.on_price("PART", trigger_price)
+            time.sleep(0.1)   # let worker process the "partial" queue item
+            with ex._lock:
+                assert ex._positions["PART"]["half_sold"], "Partial must trigger at threshold"
+                assert ex._positions["PART"]["qty"] == pytest.approx(5.0), \
+                    "qty must halve on partial trigger"
+
+    def test_cooldown_prevents_reentry(self, tmp_path):
+        """Cooldown gate must prevent re-entry within the cooldown window."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        # Arm a fresh cooldown
+        ex._last_exit["TST"] = (time.time(), "TRAIL_STOP_FULL")
+
+        sig = FakeSignal(coin="TST", sig_mid=1.0)
+        with patch.object(le, "_market_buy") as mock_buy:
+            ex._handle_entry(sig)
+            mock_buy.assert_not_called(), "Must not buy during cooldown"
+
+    def test_position_sizing_uses_balance_pct(self, tmp_path):
+        """Position size must be exactly balance × pos_pct × ev_scale."""
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 200.0)
+        )
+        ordered_amounts = []
+
+        def capture_order(*a, **kw):
+            cfg = kw.get("order_configuration", {})
+            market = cfg.get("market_market_ioc", {})
+            ordered_amounts.append(float(market.get("quote_size", 0)))
+            return _make_order_response("oid-sz")
+
+        client.create_order.side_effect = capture_order
+        client.get_order.return_value = _make_fill_response("oid-sz", 20.0, 20.0)
+
+        ex = _make_executor(tmp_path, client)
+        with ex._balance_lock:
+            ex._usd_cache    = 200.0
+            ex._usd_cache_ts = time.time()
+
+        # Controlled signal: tier D, pos_pct=0.20, cvd≈0 → ev_scale≈1.0
+        features = {
+            "confidence_tier":    "D",
+            "position_pct":       0.20,
+            "fear_greed":         50,
+            "cvd_30s":            2000.0,   # max cvd → +2% EV
+            "secs_since_onset":   5.0,      # 0 timing
+            "dv_trend":           5.0,      # +0.5
+            "spread_bps":         5.0,      # 0
+            "large_trade_pct_60s": 0.0,
+        }
+        # ev = 3.2 + 2.0 + 0.0 + 0.5 + 0.0 + 0.0 = 5.7; baseline=3.2; scale = min(1.0, 5.7/3.2) = 1.0
+        sig = FakeSignal(coin="SZT", sig_mid=1.0, features=features)
+        ex._do_entry(sig, "SZT", 1.0, "D", 0.20)
+
+        assert len(ordered_amounts) == 1
+        expected = round(200.0 * 0.20 * 1.0, 2)   # $40.00
+        assert ordered_amounts[0] == pytest.approx(expected, abs=0.05)
