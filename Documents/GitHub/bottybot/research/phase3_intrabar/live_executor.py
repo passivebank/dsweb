@@ -29,12 +29,23 @@ PARTIAL_TRIGGER = 0.20    # sell 50% when gain hits +20%
 TRAIL_PRE       = 0.07    # trail before partial
 TRAIL_POST      = 0.15    # trail after partial
 SLIP            = 0.0003
-MIN_ORDER_USD   = 5.0
+MIN_ORDER_USD   = 10.0   # raised from 5 — sub-$10 positions have negligible dollar P&L
 MAX_HOLD_S      = 14400   # 4h hard cap
 
 # ── v10 entry filter gates ───────────────────────────────────────────
-GATE_ONSET_S    = 15.0   # skip if 15+ seconds since the move started (late entry)
+GATE_ONSET_S     = 15.0   # skip if 15+ seconds since the move started (late entry)
 GATE_CVD_30S_MIN = -2000  # skip if net selling > $2000 in last 30s (18% WR vs 46%)
+
+# ── EV-based signal quality scoring ──────────────────────────────────
+# Adj-EV baselines by tier from 74-day v10 backtest. Used as the anchor
+# for per-signal scoring: signals that score above baseline get full tier
+# sizing; signals that score below get scaled down (floor 0.5×); signals
+# below MIN_EV_PCT are skipped entirely.
+#
+# Coefficients (cvd/timing/dvt/spread/ltrade) are calibrated from live
+# data — recalibrate at day 30 (2026-05-15).
+TIER_EV_BASELINE = {"A": 7.5, "B": 4.3, "C": 4.2, "D": 3.2}
+MIN_EV_PCT       = 1.5    # skip signal if estimated EV < 1.5%
 
 # Per-coin cooldown after exit: prevents re-entry on a coin that just reversed.
 # Keyed on exit classification; elapsed time must exceed cooldown before re-entry.
@@ -254,6 +265,47 @@ class LiveExecutor:
             except Exception as e:
                 log.error(f"[WORKER ERR] {e}", exc_info=True)
 
+    def _score_signal(self, sig) -> float:
+        """Estimate expected value (%) for this signal from observable features.
+
+        Starts from tier baseline (backtest adj-EV by tier), then adjusts for:
+          cvd_30s      — buying vs selling pressure in last 30s
+          secs_onset   — timing: fresh = good, chasing = bad
+          dv_trend     — volume explosion strength
+          spread_bps   — execution drag
+          large_trade% — smart-money / institutional flow confirmation
+
+        Returns estimated EV in percent (e.g. 4.2 = +4.2% expected per trade).
+        Coefficients calibrated from live data; recalibrate at day 30 (2026-05-15).
+        """
+        f    = sig.features
+        tier = f.get("confidence_tier", "D")
+        ev   = float(TIER_EV_BASELINE.get(tier, 3.2))
+
+        # CVD: net-buying pressure adds up to +2%; ranges from 0 at cvd=-2000
+        # to +2% at cvd ≥ +2000. Linear interpolation.
+        cvd = f.get("cvd_30s", 0.0)
+        ev += min(2.0, max(0.0, (cvd + 2000) / 2000.0))
+
+        # Timing: +1% at onset, 0 at 5s, −1.5% at 15s (linear decay).
+        secs = f.get("secs_since_onset", 0.0)
+        ev  += max(-1.5, 1.0 - (secs / 5.0))
+
+        # Volume explosion: high dvt confirms the move is real.
+        dvt = f.get("dv_trend", 0.0)
+        ev += 1.5 if dvt >= 10 else (0.5 if dvt >= 5 else (-1.0 if dvt < 3 else 0.0))
+
+        # Spread: execution drag (wide spread eats EV at entry and exit).
+        spread = f.get("spread_bps", 5.0)
+        ev += 0.5 if spread <= 3 else (0.0 if spread <= 7 else -0.5)
+
+        # Smart-money confirmation: large-trade participation suggests
+        # institutional flow rather than retail FOMO.
+        ltrade = f.get("large_trade_pct_60s", 0.0)
+        ev += 1.5 if ltrade >= 0.3 else (0.5 if ltrade >= 0.1 else 0.0)
+
+        return round(ev, 2)
+
     def _handle_entry(self, sig) -> None:
         coin       = sig.coin
         mid        = sig.sig_mid
@@ -299,6 +351,21 @@ class LiveExecutor:
                 log.info(f"[SKIP] {coin} already in position")
                 return
 
+        # Score signal quality. Gate below minimum EV; scale position size
+        # proportional to EV vs tier baseline so hot-day high-conviction trades
+        # get full capital while marginal signals get reduced (but not blocked).
+        ev_score    = self._score_signal(sig)
+        baseline_ev = TIER_EV_BASELINE.get(tier, 3.2)
+        if ev_score < MIN_EV_PCT:
+            log.info(f"[SKIP] {coin} ev={ev_score:.1f}% < {MIN_EV_PCT}% min — low expected value")
+            return
+        ev_scale = max(0.5, min(1.0, ev_score / baseline_ev))
+        pos_pct  = round(pos_pct * ev_scale, 3)
+        log.info(
+            f"[SCORE] {coin} Tier={tier} ev={ev_score:.1f}% "
+            f"baseline={baseline_ev}% scale={ev_scale:.2f} → pos={pos_pct:.1%}"
+        )
+
         # refresh balance
         self._refresh_balance()
         bal = self._usd_cache
@@ -325,11 +392,12 @@ class LiveExecutor:
                 "usd_in": usd_size, "buy_order": order_id,
             }
         log.info(
-            f"[ENTRY] {coin} Tier={tier} pos={pos_pct:.0%} "
+            f"[ENTRY] {coin} Tier={tier} ev={ev_score:.1f}% pos={pos_pct:.0%} "
             f"usd={usd_size:.2f} @ ~{mid:.6f}  bal={bal:.2f}"
         )
         self._log("ENTRY", coin, mid, tier=tier, usd_size=usd_size,
-                  pos_pct=pos_pct, features=sig.features)
+                  pos_pct=pos_pct, ev_score=ev_score, ev_scale=ev_scale,
+                  features=sig.features)
 
     def _reconcile_from_log(self) -> None:
         """Rebuild open positions from live_trades.jsonl on startup.
