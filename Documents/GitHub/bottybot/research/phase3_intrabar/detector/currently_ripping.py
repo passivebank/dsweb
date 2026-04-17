@@ -340,7 +340,17 @@ R5_TOP_K_RANK    = 10
 #   D  surge  + instit  n= 9  67% WR  +3.2% adj_EV  half-K 20%  → 20% bankroll
 # Tier A has the best risk-adjusted return: huge b-ratio (6.25x), tiny avg loss (-1.6%).
 # Tier B has highest WR but larger losses (-5.8%) pull Kelly below Tier A.
-R5_TIER_POS = {'A': 0.40, 'B': 0.35, 'C': 0.25, 'D': 0.20}
+#
+# LIVE RECALIBRATION 2026-04-17 (134 live shadow trades, 4.8 days):
+#   Backtest WR/EV diverged significantly from live — signal fires 109x/day vs 0.69
+#   backtest (reduced selectivity in bull market). Live-derived half-Kelly sizing:
+#   A: WR=10% adj_EV=-4.1%  → 5%  (net loser — de minimis until re-validated)
+#   B: WR=23% adj_EV=-2.8%  → 5%  (net loser — de minimis until re-validated)
+#   C: WR=57% adj_EV=+3.2%  → 21% (only profitable tier — hold sizing)
+#   D: WR=41% adj_EV=-1.1%  → 5%  (marginally losing — de minimis)
+#   At ~$195 balance, 5% = $9.75 which is below MIN_ORDER_USD ($10) → A/B/D skip.
+#   Revisit when: 50+ trades per tier OR market regime returns to backtest conditions.
+R5_TIER_POS = {'A': 0.05, 'B': 0.05, 'C': 0.21, 'D': 0.05}
 
 
 def check_r5_confirmed_run(state: CoinState, now_ns: int,
