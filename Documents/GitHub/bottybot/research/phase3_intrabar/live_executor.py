@@ -132,6 +132,45 @@ def _get_coin_balance(client, coin: str) -> float:
     return 0.0
 
 
+def _fetch_order_fill(client, order_id: str, coin: str, retries: int = 4) -> tuple:
+    """Fetch actual fill details for a completed Coinbase order.
+
+    Market IOC orders fill immediately but the ledger may need <1s to settle.
+    We retry up to `retries` times with 250ms spacing.
+
+    Returns:
+        (filled_size, filled_value_usd, avg_fill_price)
+        filled_size  — exact base-currency qty purchased (what we hold)
+        filled_value — USD actually spent (after fees)
+        avg_fill_price — weighted average fill price
+        All three are 0.0 on unrecoverable error.
+    """
+    for attempt in range(retries):
+        try:
+            resp  = client.get_order(order_id=order_id)
+            order = resp.order if hasattr(resp, "order") else resp
+            filled_size  = float(getattr(order, "filled_size",  0) or 0)
+            filled_value = float(getattr(order, "filled_value", 0) or 0)
+            if filled_value == 0:
+                # some SDK versions expose this instead
+                filled_value = float(getattr(order, "total_value_after_fees", 0) or 0)
+            if filled_size > 0:
+                avg_px = filled_value / filled_size if filled_value > 0 else 0.0
+                log.info(
+                    f"[FILL] {coin}  order={order_id}  qty={filled_size}"
+                    f"  value=${filled_value:.4f}  avg_px={avg_px:.8f}"
+                )
+                return filled_size, filled_value, avg_px
+            # Order not yet settled — wait and retry
+            log.debug(f"[FILL] {coin} fill not ready (attempt {attempt + 1}/{retries}), waiting…")
+            time.sleep(0.25)
+        except Exception as e:
+            log.error(f"[FILL ERR] {coin} order {order_id} attempt {attempt + 1}: {e}")
+            time.sleep(0.25)
+    log.error(f"[FILL ERR] {coin} could not fetch fill for {order_id} after {retries} retries")
+    return 0.0, 0.0, 0.0
+
+
 def _market_sell(client, coin: str, base_qty: float, reason: str) -> Optional[str]:
     """Attempt sell, retrying with fewer decimal places on INVALID_SIZE_PRECISION.
 
@@ -278,8 +317,17 @@ class LiveExecutor:
                     oid = _market_sell(self._client, coin, half_qty, "PARTIAL_20PCT")
                     gain = price / pos["entry_px"] - 1.0
                     if oid:
-                        log.info(f"[PARTIAL] {coin} gain={gain:+.1%}  sold 50% @ ~{price:.6f}")
-                        self._log("PARTIAL", coin, price, gain=gain)
+                        # Fetch exact remaining balance — don't assume 50% sold perfectly
+                        real_remaining = _get_coin_balance(self._client, coin)
+                        with self._lock:
+                            if coin in self._positions:
+                                est_remaining = self._positions[coin]["qty"]
+                                self._positions[coin]["qty"] = real_remaining
+                                log.info(
+                                    f"[PARTIAL] {coin} gain={gain:+.1%}  sold 50% @ ~{price:.6f}"
+                                    f"  remaining_qty={real_remaining} (est was {est_remaining:.4f})"
+                                )
+                        self._log("PARTIAL", coin, price, gain=gain, qty_remaining=real_remaining)
                     else:
                         # Sell failed — revert position state so it can retry
                         log.error(f"[PARTIAL FAIL] {coin} — reverting half_sold, full qty restored")
@@ -435,21 +483,45 @@ class LiveExecutor:
         if not order_id:
             return
 
-        approx_qty = (usd_size / mid) * (1 - SLIP)
+        # Fetch exact fill from Coinbase — never estimate qty
+        filled_qty, filled_value, fill_px = _fetch_order_fill(self._client, order_id, coin)
+        if filled_qty <= 0:
+            # Fill fetch failed after retries. Position may exist on exchange —
+            # fall back to estimate and flag the record so it can be audited.
+            log.error(
+                f"[ENTRY WARN] {coin} fill fetch failed for {order_id} — "
+                f"using estimate. Verify on Coinbase manually."
+            )
+            filled_qty   = (usd_size / mid) * (1 - SLIP)
+            filled_value = usd_size
+            fill_px      = mid
+            fill_warn    = True
+        else:
+            fill_warn = False
+
+        actual_px = fill_px if fill_px > 0 else mid
+
         with self._lock:
             self._positions[coin] = {
-                "entry_px": mid, "qty": approx_qty,
-                "peak_px": mid, "half_sold": False,
-                "entry_ts": time.time(), "tier": tier,
-                "usd_in": usd_size, "buy_order": order_id,
+                "entry_px":  actual_px,
+                "qty":       filled_qty,
+                "peak_px":   actual_px,
+                "half_sold": False,
+                "entry_ts":  time.time(),
+                "tier":      tier,
+                "usd_in":    filled_value,
+                "buy_order": order_id,
             }
         log.info(
             f"[ENTRY] {coin} Tier={tier} ev={ev_score:.1f}% pos={pos_pct:.0%} "
-            f"usd={usd_size:.2f} @ ~{mid:.6f}  bal={bal:.2f}"
+            f"qty={filled_qty:.6f} px={actual_px:.6f} usd={filled_value:.2f}  bal={bal:.2f}"
         )
-        self._log("ENTRY", coin, mid, tier=tier, usd_size=usd_size,
+        extra = {"fill_warn": True} if fill_warn else {}
+        self._log("ENTRY", coin, actual_px, tier=tier,
+                  qty=round(filled_qty, 8),
+                  usd_size=round(filled_value, 4),
                   pos_pct=pos_pct, ev_score=ev_score, ev_scale=ev_scale,
-                  features=sig.features)
+                  features=sig.features, **extra)
 
     def _reconcile_from_log(self) -> None:
         """Rebuild open positions from live_trades.jsonl on startup.
@@ -494,9 +566,15 @@ class LiveExecutor:
                 usd_size = float(rec.get("usd_size") or rec.get("usd_in") or 0)
                 tier     = rec.get("tier", "D")
                 qty_raw  = rec.get("qty")
-                qty      = float(qty_raw) if qty_raw is not None else (
-                    (usd_size / price) * (1.0 - SLIP) if price > 0 else 0.0
-                )
+                if qty_raw is not None:
+                    qty = float(qty_raw)   # exact fill qty logged at entry time
+                elif price > 0:
+                    # Legacy records without qty field — estimate from usd_size.
+                    # New records always have qty so this path should not be hit.
+                    qty = (usd_size / price) * (1.0 - SLIP)
+                    log.warning(f"[RECONCILE] {coin} no qty in ENTRY record — using estimate")
+                else:
+                    qty = 0.0
                 ts_raw = rec.get("ts") or rec.get("entry_ts", "")
                 try:
                     entry_ts = datetime.fromisoformat(
@@ -519,7 +597,13 @@ class LiveExecutor:
             elif event == "PARTIAL":
                 if stacks[coin]:
                     stacks[coin][-1]["half_sold"] = True
-                    stacks[coin][-1]["qty"]      *= 0.5
+                    qty_remaining = rec.get("qty_remaining")
+                    if qty_remaining is not None:
+                        # Use exact remaining balance logged at the time of partial sell
+                        stacks[coin][-1]["qty"] = float(qty_remaining)
+                    else:
+                        # Legacy records without qty_remaining — fall back to 50% estimate
+                        stacks[coin][-1]["qty"] *= 0.5
 
             elif event in ("EXIT", "SELL"):
                 if stacks[coin]:
