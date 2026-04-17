@@ -686,10 +686,14 @@ class LiveExecutor:
                 ts_raw = rec.get("ts") or rec.get("entry_ts", "")
                 try:
                     entry_ts = datetime.fromisoformat(
-                        ts_raw.rstrip("Z")
+                        str(ts_raw).rstrip("Z")
                     ).replace(tzinfo=_tz.utc).timestamp()
-                except Exception:
-                    entry_ts = time.time()
+                except (ValueError, AttributeError):
+                    try:
+                        entry_ts = float(ts_raw)  # Unix timestamp (early ENTRY records)
+                    except (ValueError, TypeError):
+                        log.warning(f"[RECONCILE] {coin} unparseable ts={ts_raw!r} — using current time")
+                        entry_ts = time.time()
 
                 # Restore peak_px from log if present; fall back to entry price.
                 # peak_px logged at entry equals entry_px, but once a position
@@ -794,22 +798,45 @@ class LiveExecutor:
 
         recovered = 0
         for coin, pos in open_pos.items():
+            price = None
             try:
                 resp  = self._client.get_best_bid_ask(product_ids=[f"{coin}-USD"])
                 price = float(resp.pricebooks[0].bids[0].price)
+            except Exception as e:
+                log.warning(f"[RECONCILE] price fetch failed for {coin}: {e}")
+
+            if price is not None:
                 # Update peak_px to at least the current price; the true historical
                 # peak since last ENTRY is unknowable after a restart.
                 pos["peak_px"] = max(pos["peak_px"], price)
                 gain     = price / pos["entry_px"] - 1.0
-                hold_min = (time.time() - pos["entry_ts"]) / 60.0
+                hold_s   = time.time() - pos["entry_ts"]
+                hold_min = hold_s / 60.0
+                trail    = TRAIL_POST if pos["half_sold"] else TRAIL_PRE
+                stop_px  = pos["peak_px"] * (1 - trail)
                 log.info(
-                    f"[RECONCILE] restored {coin}  tier={pos['tier']}  "
+                    f"[RECONCILE] {coin}  tier={pos['tier']}  "
                     f"entry={pos['entry_px']:.6f}  now={price:.6f}  "
                     f"gain={gain:+.1%}  held={hold_min:.0f}m  "
-                    f"half_sold={pos['half_sold']}"
+                    f"stop={stop_px:.6f}  half_sold={pos['half_sold']}"
                 )
-            except Exception as e:
-                log.warning(f"[RECONCILE] price fetch failed for {coin}: {e}")
+                # Immediate exit check: if position is already past stop threshold
+                # or time cap at startup, sell now — don't wait for the next on_price tick.
+                if hold_s >= MAX_HOLD_S:
+                    log.warning(
+                        f"[RECONCILE] {coin} past TIME_CAP (held {hold_min:.0f}m)"
+                        f" — queueing immediate exit"
+                    )
+                    self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
+                    continue
+                elif price <= stop_px:
+                    log.warning(
+                        f"[RECONCILE] {coin} past TRAIL_STOP at reconcile"
+                        f" (price={price:.6f} <= stop={stop_px:.6f}, gain={gain:+.1%})"
+                        f" — queueing immediate exit"
+                    )
+                    self._q.put(("sell", coin, pos.copy(), price, "TRAIL_STOP"))
+                    continue
 
             with self._lock:
                 self._positions[coin] = pos

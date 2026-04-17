@@ -678,9 +678,10 @@ class TestPeakPxPersistence:
         client.get_accounts.return_value = _make_accounts_response(
             _make_account("USD", 100.0)
         )
-        # Current bid is below the peak — reconciler must use logged peak_px
+        # Current bid is below peak but above trail stop (1.25 * 0.93 = 1.1625)
+        # so position stays open and we can verify peak_px was restored correctly.
         client.get_best_bid_ask.return_value = MagicMock(
-            pricebooks=[MagicMock(bids=[MagicMock(price="1.10")])]
+            pricebooks=[MagicMock(bids=[MagicMock(price="1.20")])]
         )
 
         log_path = tmp_path / "live_trades.jsonl"
@@ -703,7 +704,7 @@ class TestPeakPxPersistence:
         with ex._lock:
             pos = ex._positions.get("PK")
         assert pos is not None
-        # peak_px should be max(logged peak_px=1.25, current_bid=1.10) = 1.25
+        # peak_px should be max(logged peak_px=1.25, current_bid=1.20) = 1.25
         assert pos["peak_px"] == pytest.approx(1.25, rel=0.001), \
             f"peak_px should be restored to 1.25 from log, got {pos['peak_px']}"
 
@@ -1092,3 +1093,123 @@ class TestTradingLogicUnchanged:
         assert len(ordered_amounts) == 1
         expected = round(200.0 * 0.20 * 1.0, 2)   # $40.00
         assert ordered_amounts[0] == pytest.approx(expected, abs=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Reconcile reliability — Unix ts parsing + immediate exit on startup
+# ---------------------------------------------------------------------------
+
+class TestReconcileReliability:
+    def _make_entry_record(self, coin, entry_px, peak_px, ts, tier="D", qty=10.0):
+        return {
+            "event":     "ENTRY",
+            "coin":      coin,
+            "price":     entry_px,
+            "ts":        ts,
+            "tier":      tier,
+            "qty":       qty,
+            "usd_size":  entry_px * qty,
+            "peak_px":   peak_px,
+            "buy_order": f"oid-{coin.lower()}",
+        }
+
+    def test_reconcile_parses_unix_float_ts(self, tmp_path):
+        """ENTRY records with Unix float ts must have entry_ts correctly restored,
+        not reset to time.time() (which would reset the TIME_CAP timer)."""
+        entry_px  = 1.00
+        # Use a timestamp 1 hour ago so hold_min is ~60, not ~0
+        ts_unix   = time.time() - 3600.0
+        rec       = self._make_entry_record("TSUNI", entry_px, entry_px, ts_unix)
+        log_path  = tmp_path / "live_trades.jsonl"
+        log_path.write_text(json.dumps(rec) + "\n")
+
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        # Current price above trail stop — position should be restored, not exited
+        client.get_best_bid_ask.return_value = MagicMock(
+            pricebooks=[MagicMock(bids=[MagicMock(price="0.97")])]
+        )
+
+        ex = _make_executor(tmp_path, client)
+
+        with ex._lock:
+            pos = ex._positions.get("TSUNI")
+        assert pos is not None, "Position should be restored (price above trail stop)"
+        # entry_ts must be the original Unix float, not current time
+        assert pos["entry_ts"] == pytest.approx(ts_unix, abs=1.0), \
+            f"entry_ts should be ~{ts_unix:.0f}, got {pos['entry_ts']:.0f}"
+        # hold time should be ~3600s, not ~0
+        hold_s = time.time() - pos["entry_ts"]
+        assert hold_s > 3500, f"Expected hold_s ~3600, got {hold_s:.0f}"
+
+    def test_reconcile_immediate_trail_stop_exit(self, tmp_path):
+        """If price is already below trail stop at startup, reconciler must queue
+        an immediate TRAIL_STOP sell rather than restoring the position silently."""
+        entry_px = 1.00
+        ts_str   = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        rec      = self._make_entry_record("BLEED", entry_px, entry_px, ts_str)
+        log_path = tmp_path / "live_trades.jsonl"
+        log_path.write_text(json.dumps(rec) + "\n")
+
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        # Price already 10% below entry — well past 7% trail stop
+        client.get_best_bid_ask.return_value = MagicMock(
+            pricebooks=[MagicMock(bids=[MagicMock(price="0.90")])]
+        )
+        client.create_order.return_value = _make_order_response("oid-bleed-sell")
+        client.get_order.return_value    = _make_fill_response("oid-bleed-sell", 10.0, 0.90)
+        client.get_accounts.side_effect  = None
+
+        ex = _make_executor(tmp_path, client)
+
+        # Position must NOT be in _positions — it should have been immediately exited
+        with ex._lock:
+            assert "BLEED" not in ex._positions, \
+                "Position should not be in _positions — must have been immediately exited"
+
+        # Give worker thread time to process the queued sell
+        time.sleep(0.3)
+        log_lines = (tmp_path / "live_trades.jsonl").read_text().splitlines()
+        records   = [json.loads(l) for l in log_lines]
+        exit_recs = [r for r in records if r.get("event") == "EXIT" and r.get("coin") == "BLEED"]
+        assert exit_recs, "EXIT record must be written for immediately-exited position"
+        assert exit_recs[0]["reason"] == "TRAIL_STOP"
+
+    def test_reconcile_immediate_time_cap_exit(self, tmp_path):
+        """If hold time already exceeds MAX_HOLD_S at startup, reconciler must queue
+        an immediate TIME_CAP sell."""
+        entry_px    = 1.00
+        # Entry logged 5 hours ago (past 4h cap)
+        old_unix_ts = time.time() - (5 * 3600)
+        rec         = self._make_entry_record("AGED", entry_px, entry_px, old_unix_ts)
+        log_path    = tmp_path / "live_trades.jsonl"
+        log_path.write_text(json.dumps(rec) + "\n")
+
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        # Price flat — trail stop not triggered, but hold time is way over cap
+        client.get_best_bid_ask.return_value = MagicMock(
+            pricebooks=[MagicMock(bids=[MagicMock(price="1.00")])]
+        )
+        client.create_order.return_value = _make_order_response("oid-aged-sell")
+        client.get_order.return_value    = _make_fill_response("oid-aged-sell", 10.0, 1.00)
+
+        ex = _make_executor(tmp_path, client)
+
+        with ex._lock:
+            assert "AGED" not in ex._positions, \
+                "Position past TIME_CAP should not be in _positions"
+
+        time.sleep(0.3)
+        log_lines = (tmp_path / "live_trades.jsonl").read_text().splitlines()
+        records   = [json.loads(l) for l in log_lines]
+        exit_recs = [r for r in records if r.get("event") == "EXIT" and r.get("coin") == "AGED"]
+        assert exit_recs, "EXIT record must be written for time-capped position at startup"
+        assert exit_recs[0]["reason"] == "TIME_CAP"
