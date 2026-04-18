@@ -382,9 +382,21 @@ class LiveExecutor:
                         log.error(f"[SELL FAIL] {coin} — position RESTORED, will retry on next tick")
                         continue
 
-                    # Fetch actual fill price for accurate P&L — trigger_px is where
-                    # on_price fired, not necessarily where the order executed.
-                    _, _, fill_px = _fetch_order_fill(self._client, oid, coin)
+                    # Verify the order actually filled — IOC orders can be accepted
+                    # then cancelled with zero fill (e.g. insufficient liquidity or
+                    # exchange-side reject after submission). If fill is zero the
+                    # position still exists on the exchange: restore it so on_price
+                    # keeps managing it and queues another sell on the next tick.
+                    filled_qty, _, fill_px = _fetch_order_fill(self._client, oid, coin)
+                    if filled_qty <= 0:
+                        with self._lock:
+                            if coin not in self._positions:
+                                self._positions[coin] = pos
+                        log.error(
+                            f"[SELL CANCELLED] {coin} order {oid} — accepted but"
+                            f" zero fill; position RESTORED, will retry on next tick"
+                        )
+                        continue
                     actual_exit_px = fill_px if fill_px > 0 else trigger_px
                     gain     = actual_exit_px / pos["entry_px"] - 1.0
                     hold_min = (time.time() - pos["entry_ts"]) / 60.0
