@@ -96,6 +96,37 @@ def _get_usd_balance(client) -> float:
     return 0.0
 
 
+def _get_all_coin_balances(client) -> dict:
+    """Return all non-zero, non-USD balances held on Coinbase.
+
+    Returns:
+        dict mapping coin symbol → available qty (float)
+    """
+    balances = {}
+    cursor = None
+    while True:
+        kw = {"limit": 250}
+        if cursor:
+            kw["cursor"] = cursor
+        resp = client.get_accounts(**kw)
+        for acc in resp.accounts:
+            try:
+                cur = acc.currency if hasattr(acc, "currency") else ""
+                if not cur or cur == "USD":
+                    continue
+                ab  = acc.available_balance
+                qty = float(ab["value"] if isinstance(ab, dict) else ab.value)
+                if qty > 0:
+                    balances[cur] = qty
+            except Exception:
+                pass
+        has_next = getattr(resp, "has_next", False)
+        cursor   = getattr(resp, "cursor", None)
+        if not has_next or not cursor:
+            break
+    return balances
+
+
 def _market_buy(client, coin: str, usd_amount: float) -> Optional[str]:
     cid = str(uuid.uuid4())
     try:
@@ -805,8 +836,7 @@ class LiveExecutor:
                 log.info(f"[RECONCILE] {coin} cooldown={ck} remaining={remaining:.0f}m")
 
         if not open_pos:
-            log.info("[RECONCILE] no open positions found")
-            return
+            log.info("[RECONCILE] no open positions found in log")
 
         recovered = 0
         for coin, pos in open_pos.items():
@@ -855,6 +885,84 @@ class LiveExecutor:
             recovered += 1
 
         log.info(f"[RECONCILE] {recovered} position(s) restored")
+
+        # ── Coinbase balance sweep ────────────────────────────────────────
+        # Cross-check actual exchange balances against tracked positions.
+        # Any coin Coinbase holds that the bot isn't tracking is an orphan —
+        # either from a cancelled sell (the bug this was written to catch),
+        # a crash between FILL and ENTRY log writes, or manual interference.
+        # We restore orphans at best-effort sizing so the exit logic takes over.
+        try:
+            cb_balances = _get_all_coin_balances(self._client)
+        except Exception as e:
+            log.error(f"[RECONCILE] balance sweep failed: {e}")
+            cb_balances = {}
+
+        with self._lock:
+            tracked = set(self._positions.keys())
+
+        for coin, qty in cb_balances.items():
+            if coin in tracked:
+                # Already tracking — verify qty is in the right ballpark
+                with self._lock:
+                    pos_qty = self._positions[coin].get("qty", 0)
+                if qty > 0 and pos_qty > 0 and abs(qty - pos_qty) / max(qty, pos_qty) > 0.20:
+                    log.warning(
+                        f"[RECONCILE] {coin} qty mismatch: bot={pos_qty:.6f}"
+                        f" coinbase={qty:.6f} — updating to exchange value"
+                    )
+                    with self._lock:
+                        self._positions[coin]["qty"] = qty
+                continue
+
+            # Coin held on exchange but not tracked — orphaned position
+            price = None
+            try:
+                resp  = self._client.get_best_bid_ask(product_ids=[f"{coin}-USD"])
+                price = float(resp.pricebooks[0].bids[0].price)
+            except Exception as e:
+                log.warning(f"[RECONCILE] price fetch failed for orphan {coin}: {e}")
+
+            usd_value = (price * qty) if price else 0.0
+            if usd_value < MIN_ORDER_USD:
+                log.info(
+                    f"[RECONCILE] {coin} orphan balance={qty:.6f}"
+                    f" (~${usd_value:.2f}) below min — skipping"
+                )
+                continue
+
+            log.critical(
+                f"[RECONCILE] ORPHAN POSITION: {coin} qty={qty:.6f}"
+                f" ~${usd_value:.2f} held on Coinbase but NOT tracked by bot."
+                f" Restoring with TRAIL_STOP management. Verify entry price manually."
+            )
+            # Best-effort restore: use current price as entry_px so trail is
+            # measured from now. This is conservative — the real entry may have
+            # been higher (meaning we're already at a loss we can't recover).
+            entry_px = price if price else 1.0
+            orphan_pos = {
+                "entry_px":  entry_px,
+                "qty":       qty,
+                "peak_px":   entry_px,
+                "half_sold": False,
+                "entry_ts":  time.time(),
+                "tier":      "D",
+                "usd_in":    usd_value,
+                "buy_order": "reconciled_orphan",
+            }
+            if price is not None:
+                trail_stop_px = entry_px * (1 - TRAIL_PRE)
+                if price <= trail_stop_px:
+                    log.warning(
+                        f"[RECONCILE] {coin} orphan already past trail stop"
+                        f" — queueing immediate sell"
+                    )
+                    self._q.put(("sell", coin, orphan_pos.copy(), price, "TRAIL_STOP"))
+                    continue
+            with self._lock:
+                self._positions[coin] = orphan_pos
+
+        log.info(f"[RECONCILE] balance sweep complete — exchange has {len(cb_balances)} non-USD coin(s)")
 
     def _refresh_balance(self) -> None:
         """Refresh USD balance cache. Thread-safe; TTL-gated to avoid hammering the API."""
