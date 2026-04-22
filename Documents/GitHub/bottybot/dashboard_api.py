@@ -16,38 +16,67 @@ import uvicorn
 app = FastAPI(title="BOTTY Command Center — Phase 3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# EC2 connection
-EC2_HOST = "ec2-user@3.214.53.81"
-EC2_KEY  = str(Path.home() / "Documents/GitHub/bottybot/Botty.pem")
-
-# Remote file paths
+# File paths (same whether local or on EC2)
 LIVE_TRADES  = "/home/ec2-user/phase3_intrabar/artifacts/live_trades.jsonl"
 RECORDER_LOG = "/home/ec2-user/phase3_intrabar/artifacts/recorder.log"
 HEARTBEAT    = "/home/ec2-user/phase3_intrabar/artifacts/recorder_heartbeat.json"
 
+# Auto-detect: if running ON the EC2, files are local; otherwise SSH
+LOCAL = Path(LIVE_TRADES).exists()
+ENV_FILE = "/home/ec2-user/nkn_bot/.env" if LOCAL else ".env"
+TEMPLATES_DIR = Path(__file__).parent / "templates" if not LOCAL else Path("/home/ec2-user/botty_dashboard/templates")
+
+# SSH config (only used when not LOCAL)
+EC2_HOST = "ec2-user@3.214.53.81"
+EC2_KEY  = str(Path.home() / "Documents/GitHub/bottybot/Botty.pem")
+
 # Precision filter go-live timestamp
 DEPLOY_TS = "2026-04-22T17:13:46Z"
 
-# ── SSH cache ────────────────────────────────────────────────────────────────
+# ── Data fetching (local or SSH) ─────────────────────────────────────────────
 
-_ssh_cache: dict[str, Any] = {}
+_cache: dict[str, Any] = {}
 
-def ssh_fetch(cmd: str, key: str, ttl: int = 30) -> str:
+def _fetch(key: str, ttl: int, local_fn, ssh_cmd: str) -> str:
     now = time.monotonic()
-    entry = _ssh_cache.get(key)
+    entry = _cache.get(key)
     if entry and now - entry["ts"] < ttl:
         return entry["data"]
     try:
-        r = subprocess.run(
-            ["ssh", "-i", EC2_KEY, "-o", "StrictHostKeyChecking=no",
-             "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", EC2_HOST, cmd],
-            capture_output=True, text=True, timeout=12,
-        )
-        data = r.stdout
+        if LOCAL:
+            data = local_fn()
+        else:
+            r = subprocess.run(
+                ["ssh", "-i", EC2_KEY, "-o", "StrictHostKeyChecking=no",
+                 "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", EC2_HOST, ssh_cmd],
+                capture_output=True, text=True, timeout=12,
+            )
+            data = r.stdout
     except Exception:
         data = (entry or {}).get("data", "")
-    _ssh_cache[key] = {"ts": now, "data": data}
+    _cache[key] = {"ts": now, "data": data}
     return data
+
+def read_file(path: str, key: str, ttl: int = 25) -> str:
+    return _fetch(key, ttl,
+        local_fn=lambda: Path(path).read_text(errors="replace"),
+        ssh_cmd=f"cat {path}",
+    )
+
+def grep_file(path: str, pattern: str, key: str, ttl: int = 12, tail: int = 600) -> str:
+    return _fetch(key, ttl,
+        local_fn=lambda: subprocess.run(
+            ["grep", "-E", pattern, path],
+            capture_output=True, text=True, timeout=5,
+        ).stdout,
+        ssh_cmd=f"grep -E '{pattern}' {path} | tail -{tail}",
+    )
+
+def run_remote(cmd: str, key: str, ttl: int = 20) -> str:
+    return _fetch(key, ttl,
+        local_fn=lambda: subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5).stdout,
+        ssh_cmd=cmd,
+    )
 
 # ── Trade parsing ────────────────────────────────────────────────────────────
 
@@ -60,7 +89,7 @@ def _get_field(obj: dict, *keys, default=0):
 
 def parse_live_trades():
     """Parse live_trades.jsonl → (closed_trades, open_positions)."""
-    raw = ssh_fetch(f"cat {LIVE_TRADES}", "live_trades", ttl=25)
+    raw = read_file(LIVE_TRADES, "live_trades", ttl=25)
     events = []
     for line in raw.strip().splitlines():
         try:
@@ -165,7 +194,7 @@ def get_portfolio() -> dict:
     try:
         from dotenv import dotenv_values
         from coinbase.rest import RESTClient
-        cfg    = dotenv_values(".env")
+        cfg    = dotenv_values(ENV_FILE)
         client = RESTClient(api_key=cfg["CB_API_KEY"], api_secret=cfg["CB_API_SECRET"])
 
         cash = 0.0
@@ -233,9 +262,9 @@ def get_portfolio() -> dict:
 # ── Log parsing ───────────────────────────────────────────────────────────────
 
 def parse_log():
-    raw = ssh_fetch(
-        f"grep -E '\\[SKIP\\]|\\[SIG-QUEUED\\]|\\[ENTRY\\]|\\[EXIT\\]|\\[stats\\]' {RECORDER_LOG} | tail -600",
-        "filter_log", ttl=12,
+    raw = grep_file(RECORDER_LOG,
+        r'\[SKIP\]|\[SIG-QUEUED\]|\[ENTRY\]|\[EXIT\]|\[stats\]',
+        "filter_log", ttl=12, tail=600,
     )
 
     skip_counts: dict[str, int] = {}
@@ -274,7 +303,7 @@ def parse_log():
 
 @app.get("/")
 def serve_dashboard():
-    return FileResponse("templates/command_center_v3.html")
+    return FileResponse(str(TEMPLATES_DIR / "command_center_v3.html"))
 
 
 @app.get("/api/trades")
@@ -348,13 +377,13 @@ def api_log():
 
 @app.get("/api/heartbeat")
 def api_heartbeat():
-    raw = ssh_fetch(f"cat {HEARTBEAT}", "heartbeat", ttl=12)
+    raw = read_file(HEARTBEAT, "heartbeat", ttl=12)
     try:
         hb = json.loads(raw)
     except Exception:
         hb = {}
 
-    svc = ssh_fetch("systemctl is-active cb_recorder.service", "svc_status", ttl=20)
+    svc = run_remote("systemctl is-active cb_recorder.service", "svc_status", ttl=20)
     hb["service_active"] = svc.strip() == "active"
     hb["service_status"] = svc.strip()
     return hb
@@ -363,17 +392,25 @@ def api_heartbeat():
 @app.get("/api/restart-service")
 def api_restart_service():
     try:
-        r = subprocess.run(
-            ["ssh", "-i", EC2_KEY, "-o", "StrictHostKeyChecking=no",
-             "-o", "ConnectTimeout=5", EC2_HOST,
-             "sudo systemctl restart cb_recorder.service && echo OK"],
-            capture_output=True, text=True, timeout=25,
-        )
-        ok = "OK" in r.stdout
-        # Invalidate caches so next poll gets fresh data
-        for k in list(_ssh_cache):
-            del _ssh_cache[k]
-        return {"status": "restarted" if ok else "error", "output": (r.stdout + r.stderr).strip()}
+        if LOCAL:
+            r = subprocess.run(
+                ["sudo", "systemctl", "restart", "cb_recorder.service"],
+                capture_output=True, text=True, timeout=25,
+            )
+            ok = r.returncode == 0
+            out = (r.stdout + r.stderr).strip() or "OK"
+        else:
+            r = subprocess.run(
+                ["ssh", "-i", EC2_KEY, "-o", "StrictHostKeyChecking=no",
+                 "-o", "ConnectTimeout=5", EC2_HOST,
+                 "sudo systemctl restart cb_recorder.service && echo OK"],
+                capture_output=True, text=True, timeout=25,
+            )
+            ok = "OK" in r.stdout
+            out = (r.stdout + r.stderr).strip()
+        for k in list(_cache):
+            del _cache[k]
+        return {"status": "restarted" if ok else "error", "output": out}
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
 
@@ -383,7 +420,7 @@ def api_cancel_orders():
     try:
         from dotenv import dotenv_values
         from coinbase.rest import RESTClient
-        cfg    = dotenv_values(".env")
+        cfg    = dotenv_values(ENV_FILE)
         client = RESTClient(api_key=cfg["CB_API_KEY"], api_secret=cfg["CB_API_SECRET"])
         orders = client.list_orders(order_status=["OPEN"], limit=100)
         ids    = [o.order_id for o in orders.orders]
