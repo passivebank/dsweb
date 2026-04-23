@@ -126,14 +126,23 @@ def parse_live_trades():
             if entry:
                 features = entry.get("features") or entry.get("sig_features") or {}
 
+            exit_ts = _get_field(e, "ts", "exit_ts", default="")
             variant = (
                 entry.get("variant") if entry else None
             ) or features.get("variant", "")
 
-            # Label pre-deploy trades clearly
-            exit_ts = _get_field(e, "ts", "exit_ts", default="")
+            # Infer variant from feature signature when not explicit
             if not variant:
-                variant = "precision" if exit_ts >= DEPLOY_TS else "legacy"
+                if features.get("dv_5m_usd") and features.get("dv_trend_5m"):
+                    variant = "R10_EXPLOSION_ONSET"
+                elif features.get("step_1m") or features.get("total_3m"):
+                    variant = "R7_STAIRCASE"
+                elif features.get("confidence_tier") or features.get("dv_trend"):
+                    variant = "R5_CONFIRMED_RUN"
+                elif exit_ts >= DEPLOY_TS:
+                    variant = "precision"
+                else:
+                    variant = "legacy"
 
             entry_ts = _get_field(entry or {}, "ts", "entry_ts", default="")
             entry_px = _get_field(entry or {}, "price", "entry_px", default=0)
@@ -319,7 +328,8 @@ def api_trades():
     since_deploy = [t for t in completed if t["exit_ts"] >= DEPLOY_TS]
     sd_wins      = [t for t in since_deploy if t["win"]]
 
-    r7 = [t for t in completed if "R7" in t["variant"]]
+    r7  = [t for t in completed if "R7" in t["variant"]]
+    r10 = [t for t in completed if "R10" in t["variant"]]
     r5 = [t for t in completed if "R5" in t["variant"]]
 
     def variant_stats(subset):
@@ -356,6 +366,7 @@ def api_trades():
             "deploy_pnl":      round(sum(t["pnl_usd"] for t in since_deploy), 2),
             "r7":              variant_stats(r7),
             "r5":              variant_stats(r5),
+            "r10":             variant_stats(r10),
         },
     }
 

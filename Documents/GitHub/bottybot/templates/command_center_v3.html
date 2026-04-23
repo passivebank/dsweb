@@ -18,6 +18,7 @@
   --warn:    #f59e0b;
   --r7:      #a78bfa;
   --r5:      #fb923c;
+  --r10:     #34d399;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: var(--bg); color: var(--text); font-family: 'SF Mono','Consolas','Menlo',monospace; font-size: 12px; }
@@ -121,6 +122,7 @@ tr:hover td { background: #0f1828; }
 .vbr5  { background: #201000; color: var(--r5); }
 .vbnew { background: #0a1e30; color: var(--accent); }
 .vbleg { background: #141e2e; color: var(--muted); }
+.vbr10 { background: #0a2a1a; color: var(--r10); }
 .rbadge { display: inline-block; font-size: 9px; border-radius: 3px; padding: 1px 5px; background: #141e2e; color: var(--muted); }
 .rbadge.trail { background: #1a1040; color: var(--r7); }
 .rbadge.time  { background: #0a1e1a; color: #22c4d3; }
@@ -250,7 +252,7 @@ tr:hover td { background: #0f1828; }
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <div class="card-title" style="margin:0">Recent Trades</div>
         <label style="font-size:10px;color:var(--muted);cursor:pointer;user-select:none">
-          <input type="checkbox" id="new-algo-only" onchange="renderTrades()"> New algo only
+          <input type="checkbox" id="new-algo-only" onchange="renderTrades()" checked> New algo only
         </label>
       </div>
       <div style="overflow-x:auto;max-height:380px;overflow-y:auto">
@@ -355,6 +357,7 @@ function elapsed(ts) {
 function variantBadge(v) {
   if (v === 'R7_STAIRCASE')     return `<span class="vbadge vbr7">R7</span>`;
   if (v === 'R5_CONFIRMED_RUN') return `<span class="vbadge vbr5">R5</span>`;
+  if (v === 'R10_EXPLOSION_ONSET') return `<span class="vbadge vbr10">R10</span>`;
   if (v === 'precision')        return `<span class="vbadge vbnew">NEW</span>`;
   return `<span class="vbadge vbleg">LEGACY</span>`;
 }
@@ -525,6 +528,7 @@ function renderStats(s) {
   const rows = [];
   if (s.r7 && s.r7.n > 0) rows.push(vPerfRow('R7', 'vbr7', s.r7));
   if (s.r5 && s.r5.n > 0) rows.push(vPerfRow('R5', 'vbr5', s.r5));
+  if (s.r10 && s.r10.n > 0) rows.push(vPerfRow('R10', 'vbr10', s.r10));
   $('variant-perf').innerHTML = rows.join('');
 }
 

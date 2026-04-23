@@ -58,6 +58,18 @@ COOLDOWN_S = {
     "TIME_CAP_GAIN":      20 * 60,  # timed out profitable — allow fresh re-entry soon
 }
 
+# ── Defensive intraday gates (added 2026-04-19 after -12% bankroll day) ──
+# Halt all new entries when cumulative bankroll-weighted P&L for the current
+# UTC day drops below this threshold. Resets at UTC midnight.
+INTRADAY_KILL_BANKROLL_PCT = -0.05    # halt at -5% bankroll for the UTC day
+# Skip a coin for the rest of the UTC day after N losses on it.
+MAX_LOSSES_PER_COIN_PER_DAY = 2
+# Tier blocklist. Tier C had 27% WR / -1.49% avg / -16.36% summed across
+# 11 trades on Apr 15-19 — structurally negative EV. Tiers A/B/D kept.
+# Override at runtime by exporting LIVE_BLOCKED_TIERS="C,D" etc.
+_blocked_env = (os.environ.get("LIVE_BLOCKED_TIERS") or "C").strip().upper()
+LIVE_BLOCKED_TIERS = {t.strip() for t in _blocked_env.split(",") if t.strip()}
+
 CB_ENV_FILE = Path("/home/ec2-user/nkn_bot/.env")
 
 
@@ -306,6 +318,12 @@ class LiveExecutor:
         # coins currently being entered (check-then-buy atomicity guard)
         self._pending_entry: set = set()
 
+        # ── Defensive intraday tracking (lazy-resets at UTC midnight) ──
+        self._daily_state_day: str = ""             # current UTC date ISO
+        self._daily_pnl_bankroll: float = 0.0       # cum bankroll-pct for today
+        self._daily_loss_count: dict = {}           # coin → loss_count_today
+        self._daily_killed: bool = False            # latched once kill threshold hit
+
         self._thread = threading.Thread(target=self._worker, daemon=True, name="live-exec")
         self._thread.start()
         # restore any positions that were open when the service last stopped
@@ -319,8 +337,8 @@ class LiveExecutor:
     def on_signal(self, sig) -> None:
         """Non-blocking: enqueue signal for background processing."""
         log.info("[SIG-IN] variant=%s coin=%s", getattr(sig, "variant", "?"), getattr(sig, "coin", "?"))
-        if sig.variant == "R5_CONFIRMED_RUN":
-            log.info("[SIG-QUEUED] %s", sig.coin)
+        if sig.variant in ("R5_CONFIRMED_RUN", "R7_STAIRCASE", "R10_EXPLOSION_ONSET"):
+            log.info("[SIG-QUEUED] %s variant=%s", sig.coin, sig.variant)
             self._q.put(("signal", sig))
 
     def on_price(self, coin: str, price: float) -> None:
@@ -337,13 +355,56 @@ class LiveExecutor:
 
             gain     = price / pos["entry_px"] - 1.0
             hold_s   = time.time() - pos["entry_ts"]
-            trail    = TRAIL_POST if pos["half_sold"] else TRAIL_PRE
+
+            # T+8 adaptive checkpoint (runs once per position)
+            if not pos.get("t8_checked") and hold_s >= 480:
+                pos["t8_checked"] = True
+                if gain >= 0.10:
+                    pos["strong_confirmed"] = True
+                    log.info(f"[T8-STRONG] {coin} gain={gain:+.1%} "
+                             f"— STRONG confirmed, no partial, 15% trail")
+                elif gain <= 0.02:
+                    # Fade: sell 75%, keep 25% under 15% trail
+                    fade_qty = pos["qty"] * 0.75
+                    pos["qty"] *= 0.25
+                    pos["half_sold"] = True  # block further partial trigger
+                    pos_copy = pos.copy()
+                    pos_copy["fade_qty"] = fade_qty
+                    self._q.put(("sell_fade", coin, pos_copy, price))
+                    log.info(f"[T8-FADE] {coin} gain={gain:+.1%} "
+                             f"— fade, selling 75%")
+
+            # Trail: 15% if STRONG confirmed or partial already sold; 7% otherwise
+            if pos.get("strong_confirmed") or pos["half_sold"]:
+                trail = TRAIL_POST
+            else:
+                trail = TRAIL_PRE
             stop_px  = pos["peak_px"] * (1 - trail)
+
+            # R7 positions: fixed 5-min hold — skip trail/T8/partial
+            if pos.get("exit_policy") == "time_300s":
+                if hold_s >= 300:
+                    self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
+                    del self._positions[coin]
+                return
+
+            # R10 positions: 120m hold, 18% trail from peak, 10% hard stop — no partial
+            if pos.get("exit_policy") == "r10_120m":
+                if hold_s >= 7200:
+                    self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
+                    del self._positions[coin]
+                    return
+                hard_stop_px = pos["entry_px"] * 0.90
+                trail_px     = pos["peak_px"]  * 0.82
+                if price <= hard_stop_px or price <= trail_px:
+                    self._q.put(("sell", coin, pos.copy(), price, "TRAIL_STOP"))
+                    del self._positions[coin]
+                return
 
             if hold_s >= MAX_HOLD_S:
                 self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
                 del self._positions[coin]   # worker restores if sell fails
-            elif not pos["half_sold"] and gain >= PARTIAL_TRIGGER:
+            elif not pos["half_sold"] and not pos.get("strong_confirmed") and gain >= PARTIAL_TRIGGER:
                 pos["half_sold"] = True
                 pos["qty"] *= 0.5
                 self._q.put(("partial", coin, pos.copy(), price))
@@ -401,6 +462,41 @@ class LiveExecutor:
                                 self._positions[coin]["half_sold"] = False
                                 self._positions[coin]["qty"] *= 2.0
 
+                elif cmd == "sell_fade":
+                    # T+8 fade: sell the fade_qty (75%), keep 25% on trail
+                    _, coin, pos, price = item
+                    fade_qty = pos.get("fade_qty", pos["qty"])
+                    oid = _market_sell(self._client, coin, fade_qty, "T8_FADE")
+                    gain = price / pos["entry_px"] - 1.0
+                    if oid:
+                        filled_qty, _, fill_px = _fetch_order_fill(
+                            self._client, oid, coin)
+                        if filled_qty <= 0:
+                            log.error(f"[T8-FADE ZERO-FILL] {coin} — restoring qty")
+                            with self._lock:
+                                if coin in self._positions:
+                                    self._positions[coin]["qty"] += fade_qty
+                                    self._positions[coin]["half_sold"] = False
+                        else:
+                            real_rem = _get_coin_balance(self._client, coin)
+                            if real_rem is None:
+                                real_rem = pos["qty"]  # already 25% in on_price
+                            with self._lock:
+                                if coin in self._positions:
+                                    self._positions[coin]["qty"] = real_rem
+                            actual_px = fill_px if fill_px > 0 else price
+                            actual_gain = actual_px / pos["entry_px"] - 1.0
+                            log.info(f"[T8-FADE] {coin} gain={actual_gain:+.1%}"
+                                     f" sold 75%  remaining={real_rem}")
+                            self._log("T8_FADE", coin, actual_px,
+                                      gain=actual_gain, qty_remaining=real_rem)
+                    else:
+                        log.error(f"[T8-FADE FAIL] {coin} — restoring qty")
+                        with self._lock:
+                            if coin in self._positions:
+                                self._positions[coin]["qty"] += fade_qty
+                                self._positions[coin]["half_sold"] = False
+
                 elif cmd == "sell":
                     _, coin, pos, trigger_px, reason = item
                     oid = _market_sell(self._client, coin, pos["qty"], reason)
@@ -454,6 +550,8 @@ class LiveExecutor:
                         ck = "TIME_CAP_GAIN"
                     self._last_exit[coin] = (time.time(), ck)
                     log.info(f"[COOLDOWN] {coin} → {ck} ({COOLDOWN_S.get(ck, 0) // 60}m)")
+                    # Update intraday tracking for kill-switch + per-coin loss gate
+                    self._record_exit_for_intraday(coin, gain, pos.get("pos_pct", 0.20))
 
             except Exception as e:
                 log.error(f"[WORKER ERR] {e}", exc_info=True)
@@ -471,6 +569,8 @@ class LiveExecutor:
         Returns estimated EV in percent (e.g. 4.2 = +4.2% expected per trade).
         Coefficients calibrated from live data; recalibrate at day 30 (2026-05-15).
         """
+        if getattr(sig, "variant", "") == "R10_EXPLOSION_ONSET":
+            return 13.4  # backtest-validated EV (N=2, WR=100%, false-pos filtered)
         f    = sig.features
         tier = f.get("confidence_tier", "D")
         ev   = float(TIER_EV_BASELINE.get(tier, 3.2))
@@ -499,12 +599,63 @@ class LiveExecutor:
 
         return round(ev, 2)
 
+    def _check_daily_reset(self) -> str:
+        """Reset intraday tracking at UTC midnight. Returns current UTC ISO date."""
+        today = datetime.now(_tz.utc).date().isoformat()
+        if today != self._daily_state_day:
+            if self._daily_state_day:
+                log.info(
+                    f"[DAY-RESET] {self._daily_state_day} closed at "
+                    f"bankroll={self._daily_pnl_bankroll*100:+.2f}% "
+                    f"killed={self._daily_killed} → opening {today}"
+                )
+            self._daily_state_day = today
+            self._daily_pnl_bankroll = 0.0
+            self._daily_loss_count = {}
+            self._daily_killed = False
+        return today
+
+    def _record_exit_for_intraday(self, coin: str, gain: float, pos_pct: float) -> None:
+        """Update intraday tracking after an exit. Called from worker thread."""
+        self._check_daily_reset()
+        bankroll_impact = float(gain) * float(pos_pct)
+        self._daily_pnl_bankroll += bankroll_impact
+        if gain < 0:
+            self._daily_loss_count[coin] = self._daily_loss_count.get(coin, 0) + 1
+        if (not self._daily_killed
+                and self._daily_pnl_bankroll <= INTRADAY_KILL_BANKROLL_PCT):
+            self._daily_killed = True
+            log.warning(
+                f"[KILL-SWITCH] cum_day_bankroll={self._daily_pnl_bankroll*100:+.2f}% "
+                f"<= {INTRADAY_KILL_BANKROLL_PCT*100:.1f}% — halting ALL new entries "
+                f"until UTC midnight"
+            )
+
     def _handle_entry(self, sig) -> None:
         coin       = sig.coin
         mid        = sig.sig_mid
         tier       = sig.features.get("confidence_tier", "D")
         pos_pct    = sig.features.get("position_pct", 0.20)
         fear_greed = sig.features.get("fear_greed", 50)
+
+        # ── Defensive intraday gates ────────────────────────────────
+        self._check_daily_reset()
+        if self._daily_killed:
+            log.info(
+                f"[SKIP] {coin} daily kill-switch active "
+                f"(cum_bankroll={self._daily_pnl_bankroll*100:+.2f}%)"
+            )
+            return
+        if tier in LIVE_BLOCKED_TIERS:
+            log.info(f"[SKIP] {coin} Tier={tier} in LIVE_BLOCKED_TIERS={sorted(LIVE_BLOCKED_TIERS)}")
+            return
+        coin_losses_today = self._daily_loss_count.get(coin, 0)
+        if coin_losses_today >= MAX_LOSSES_PER_COIN_PER_DAY:
+            log.info(
+                f"[SKIP] {coin} losses_today={coin_losses_today} "
+                f">= {MAX_LOSSES_PER_COIN_PER_DAY} — coin blocked rest of UTC day"
+            )
+            return
 
         # Tier A/B are consolidation patterns (r5m 0.5-1%).
         # Skip only in true panic: F&G < 15 AND BTC not recovering intraday.
@@ -530,6 +681,48 @@ class LiveExecutor:
         if secs_onset >= GATE_ONSET_S:
             log.info(f"[SKIP] {coin} secs_since_onset={secs_onset:.1f}s >= {GATE_ONSET_S}s — late entry")
             return
+
+        # -- Precision filter stack (2026-04-22 PhD analysis) --
+        variant = getattr(sig, "variant", "")
+        if variant not in ("R5_CONFIRMED_RUN", "R7_STAIRCASE", "R10_EXPLOSION_ONSET"):
+            log.info(f"[SKIP] {coin} variant={variant} not approved")
+            return
+
+        if variant == "R10_EXPLOSION_ONSET":
+            # R10 bypasses rank/breadth/CVD precision stack — designed for non-rank-1 runners
+            log.info(f"[R10] {coin} explosion onset — dv5m={sig.features.get('dv_5m_usd',0):,.0f} trend={sig.features.get('dv_trend_5m',0):.1f}x")
+        else:
+            if sig.features.get("rank_60s", 99) != 1:
+                log.info(f"[SKIP] {coin} rank not 1")
+                return
+            if sig.features.get("cg_trending") is True:
+                log.info(f"[SKIP] {coin} cg_trending=True")
+                return
+            breadth = sig.features.get("market_breadth_5m", 0)
+            if not (3 <= breadth <= 10):
+                log.info(f"[SKIP] {coin} breadth={breadth} not 3-10")
+                return
+            if sig.features.get("signals_24h", 0) > 15:
+                log.info(f"[SKIP] {coin} signals_24h too high")
+                return
+        if variant == "R7_STAIRCASE":
+            if sig.features.get("step_2m", 0) <= 0.008:
+                log.info(f"[SKIP] {coin} R7 step_2m weak")
+                return
+            if sig.features.get("candle_close_str_1m", 0) <= 0.70:
+                log.info(f"[SKIP] {coin} R7 candle_close_str weak")
+                return
+        if variant == "R5_CONFIRMED_RUN":
+            if sig.features.get("dv_trend", 0) <= 2.0:
+                log.info(f"[SKIP] {coin} R5 dv_trend low")
+                return
+            if sig.features.get("ask_depth_usd", 0) <= 500:
+                log.info(f"[SKIP] {coin} R5 ask_depth too thin")
+                return
+            spread_bps = sig.features.get("spread_bps", 0)
+            if not (5 <= spread_bps < 10):
+                log.info(f"[SKIP] {coin} R5 spread={spread_bps:.1f} not 5-10bps")
+                return
 
         # Per-coin cooldown gate: if this coin recently stopped us out or timed out at a
         # loss, require a minimum rest period before re-entering.
@@ -570,11 +763,14 @@ class LiveExecutor:
         if ev_score < MIN_EV_PCT:
             log.info(f"[SKIP] {coin} ev={ev_score:.1f}% < {MIN_EV_PCT}% min — low expected value")
             return
-        ev_scale = max(0.5, min(1.0, ev_score / baseline_ev))
-        pos_pct  = round(pos_pct * ev_scale, 3)
+        ev_scale  = max(0.5, min(1.0, ev_score / baseline_ev))
+        cls_scale = float(sig.features.get("cls_pos_scale", 1.0))
+        pos_pct   = round(pos_pct * ev_scale * cls_scale, 3)
+        cls_v     = sig.features.get("cls_verdict", "unscored")
         log.info(
             f"[SCORE] {coin} Tier={tier} ev={ev_score:.1f}% "
-            f"baseline={baseline_ev}% scale={ev_scale:.2f} → pos={pos_pct:.1%}"
+            f"ev_scale={ev_scale:.2f} cls={cls_scale:.2f}({cls_v}) "
+            f"-> pos={pos_pct:.1%}"
         )
 
         # Refresh balance and size the order
@@ -632,6 +828,8 @@ class LiveExecutor:
                 "tier":      tier,
                 "usd_in":    filled_value,
                 "buy_order": order_id,
+                "pos_pct":   pos_pct,
+                "exit_policy": "time_300s" if getattr(sig, "variant", "") == "R7_STAIRCASE" else ("r10_120m" if getattr(sig, "variant", "") == "R10_EXPLOSION_ONSET" else "trail"),
             }
         log.info(
             f"[ENTRY] {coin} Tier={tier} ev={ev_score:.1f}% pos={pos_pct:.0%} "
@@ -756,6 +954,7 @@ class LiveExecutor:
                     "tier":      tier,
                     "usd_in":    usd_size,
                     "buy_order": buy_order,
+                    "pos_pct":   float(rec.get("pos_pct") or 0.20),
                 })
 
             elif event == "PARTIAL":
