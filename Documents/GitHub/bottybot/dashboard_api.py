@@ -319,14 +319,11 @@ def serve_dashboard():
 def api_trades():
     closed, open_pos = parse_live_trades()
 
-    completed = [t for t in closed if t["usd_in"] > 0]
+    completed = [t for t in closed if t["usd_in"] > 0 and t["exit_ts"] >= DEPLOY_TS]
     wins      = [t for t in completed if t["win"]]
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today     = [t for t in completed if t["exit_ts"].startswith(today_str)]
-
-    since_deploy = [t for t in completed if t["exit_ts"] >= DEPLOY_TS]
-    sd_wins      = [t for t in since_deploy if t["win"]]
 
     r7  = [t for t in completed if "R7" in t["variant"]]
     r10 = [t for t in completed if "R10" in t["variant"]]
@@ -360,10 +357,10 @@ def api_trades():
             "avg_pct":         round(sum(t["gain"] for t in completed) / max(len(completed), 1) * 100, 2),
             "today_n":         len(today),
             "today_pnl":       round(sum(t["pnl_usd"] for t in today), 2),
-            "deploy_n":        len(since_deploy),
-            "deploy_wins":     len(sd_wins),
-            "deploy_wr":       round(len(sd_wins) / max(len(since_deploy), 1) * 100, 1),
-            "deploy_pnl":      round(sum(t["pnl_usd"] for t in since_deploy), 2),
+            "deploy_n":        len(completed),
+            "deploy_wins":     len(wins),
+            "deploy_wr":       round(len(wins) / max(len(completed), 1) * 100, 1),
+            "deploy_pnl":      round(sum(t["pnl_usd"] for t in completed), 2),
             "r7":              variant_stats(r7),
             "r5":              variant_stats(r5),
             "r10":             variant_stats(r10),
