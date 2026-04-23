@@ -731,6 +731,66 @@ def check_r9_volume_staircase(state: CoinState, now_ns: int,
     )
 
 
+
+# ----- R10 EXPLOSION_ONSET (research-validated 2026-04-23) -------------------
+# Shadow-only observer. Entry signal validated across 40,323 iterations on
+# 58 runner events / 384 coins (3.5 days Coinbase tick data).
+# Signal: dv_trend_5m>=4x + candle_str>=0.60 + buy_share_5m>=0.55
+# Validated EV +26%, WR=100%, n=18, 18 distinct coins, EV_ex_top=+25.4%.
+# Optimal exit: 120m hold / 18% trailing stop.
+# No rank_60s==1 gate — runners are slow-building, not fastest-in-universe.
+# live_executor blocks R10 — shadow accumulate until n>=60.
+R10_SPREAD_MAX_BPS  = 30.0
+R10_DV_FLOOR_USD    = 10_000
+R10_DV_TREND_MIN    = 4.0    # 5m vol must be 4x prior 5m (validated optimal)
+R10_DV_TREND_MAX    = 12.0   # cap: >12x on low abs volume = micro-cap noise
+R10_CANDLE_STR_MIN  = 0.60
+R10_BUY_SHARE_MIN   = 0.55
+R10_RET_5M_MIN      = 0.02   # >=2% in 5m — runner must be live
+R10_RET_5M_MAX      = 0.40   # <40% in 5m — not exhausted
+
+
+def check_r10_explosion_onset(state: CoinState, now_ns: int,
+                               rank_60s: Optional[int],
+                               spread_bps: float = 0.0) -> Optional[SignalEvent]:
+    if spread_bps > R10_SPREAD_MAX_BPS:
+        return None
+    dv_5m      = state.dollar_volume_in(now_ns, 300)
+    dv_10m     = state.dollar_volume_in(now_ns, 600)
+    dv_5m_prev = dv_10m - dv_5m
+    if dv_5m < R10_DV_FLOOR_USD:
+        return None
+    if dv_5m_prev <= 0 or (dv_5m / dv_5m_prev) < R10_DV_TREND_MIN:
+        return None
+    if (dv_5m / dv_5m_prev) > R10_DV_TREND_MAX:
+        return None
+    candle_str = state.candle_close_strength(now_ns, lookback_s=60)
+    if candle_str < R10_CANDLE_STR_MIN:
+        return None
+    buy_share = state.buy_share_in(now_ns, 300)
+    if buy_share < R10_BUY_SHARE_MIN:
+        return None
+    ret_5m = state.return_over(now_ns, 300)
+    if ret_5m < R10_RET_5M_MIN or ret_5m > R10_RET_5M_MAX:
+        return None
+    dv_trend = round(dv_5m / dv_5m_prev, 2) if dv_5m_prev > 0 else 0.0
+    return SignalEvent(
+        variant=R10_EXPLOSION_ONSET,
+        coin=state.coin,
+        sig_ts_ns=now_ns,
+        sig_mid=state.last_mid,
+        features={
+            dv_5m_usd:    round(dv_5m, 2),
+            dv_trend_5m:  dv_trend,
+            candle_str:   round(candle_str, 3),
+            buy_share_5m: round(buy_share, 3),
+            ret_5m:       round(ret_5m, 5),
+            rank_60s:     rank_60s,
+            spread_bps:   round(spread_bps, 1),
+        },
+    )
+
+
 VARIANTS = [
     ("R1_TAPE_BURST",         check_r1_tape_burst,         {"requires_prev_rank": False}),
     ("R2_RANK_TAKEOVER",      check_r2_rank_takeover,      {"requires_prev_rank": True}),
@@ -741,4 +801,5 @@ VARIANTS = [
     ("R7_STAIRCASE",          check_r7_staircase,          {"requires_prev_rank": False, "requires_ret_24h": True}),
     ("R8_HIGH_CONVICTION",    check_r8_high_conviction,    {"requires_prev_rank": False, "requires_ret_24h": True}),
     ("R9_VOLUME_STAIRCASE",   check_r9_volume_staircase,   {"requires_prev_rank": False, "requires_ret_24h": True}),
+    ("R10_EXPLOSION_ONSET",   check_r10_explosion_onset,   {"requires_prev_rank": False}),
 ]
