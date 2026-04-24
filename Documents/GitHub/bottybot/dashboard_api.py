@@ -210,16 +210,27 @@ def get_portfolio() -> dict:
         coin_accts: list[dict] = []
         SKIP_COINS = {"CLV", "NU", "WBTC", "CBETH"}
 
-        for a in client.get_accounts(limit=250).accounts:
-            avail = float(a.available_balance["value"])
-            held  = float(a.hold["value"]) if isinstance(a.hold, dict) else 0.0
-            total = avail + held
-            if total < 0.001:
-                continue
-            if a.currency in ("USD", "USDC", "USDT"):
-                cash += total
-            elif a.currency not in SKIP_COINS:
-                coin_accts.append({"coin": a.currency, "qty": total, "avail": avail})
+        cursor = None
+        while True:
+            kwargs = {"limit": 250}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = client.get_accounts(**kwargs)
+            for a in resp.accounts:
+                avail = float(a.available_balance["value"])
+                held  = float(a.hold["value"]) if isinstance(a.hold, dict) else 0.0
+                total = avail + held
+                if total < 0.001:
+                    continue
+                if a.currency in ("USD", "USDC", "USDT"):
+                    cash += total
+                elif a.currency not in SKIP_COINS:
+                    coin_accts.append({"coin": a.currency, "qty": total, "avail": avail})
+            if not getattr(resp, "has_next", False):
+                break
+            cursor = getattr(resp, "cursor", None)
+            if not cursor:
+                break
 
         prices: dict[str, float] = {}
         if coin_accts:
@@ -325,9 +336,10 @@ def api_trades():
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today     = [t for t in completed if t["exit_ts"].startswith(today_str)]
 
-    r7  = [t for t in completed if "R7" in t["variant"]]
+    r11 = [t for t in completed if t["variant"] == "R11_BIG_STAIRCASE"]
+    r7  = [t for t in completed if "R7" in t["variant"] and t["variant"] != "R11_BIG_STAIRCASE"]
     r10 = [t for t in completed if "R10" in t["variant"]]
-    r5 = [t for t in completed if "R5" in t["variant"]]
+    r5  = [t for t in completed if "R5" in t["variant"]]
 
     def variant_stats(subset):
         w = [t for t in subset if t["win"]]
@@ -361,6 +373,7 @@ def api_trades():
             "deploy_wins":     len(wins),
             "deploy_wr":       round(len(wins) / max(len(completed), 1) * 100, 1),
             "deploy_pnl":      round(sum(t["pnl_usd"] for t in completed), 2),
+            "r11":             variant_stats(r11),
             "r7":              variant_stats(r7),
             "r5":              variant_stats(r5),
             "r10":             variant_stats(r10),

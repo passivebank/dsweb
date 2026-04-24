@@ -845,6 +845,12 @@ class LiveExecutor:
 
         actual_px = fill_px if fill_px > 0 else mid
 
+        _sig_variant = getattr(sig, "variant", "")
+        _is_r11 = (_sig_variant == "R7_STAIRCASE" and
+                   (sig.features.get("step_2m", 0) or 0) >= 0.018 and
+                   (sig.features.get("spread_bps", 999) or 999) <= 8)
+        effective_variant = "R11_BIG_STAIRCASE" if _is_r11 else _sig_variant
+
         with self._lock:
             self._positions[coin] = {
                 "entry_px":  actual_px,
@@ -857,11 +863,9 @@ class LiveExecutor:
                 "buy_order": order_id,
                 "pos_pct":   pos_pct,
                 "exit_policy": (
-                    "r11_trail" if (getattr(sig, "variant", "") == "R7_STAIRCASE" and
-                                    (sig.features.get("step_2m", 0) or 0) >= 0.018 and
-                                    (sig.features.get("spread_bps", 999) or 999) <= 8)
-                    else "time_300s" if getattr(sig, "variant", "") == "R7_STAIRCASE"
-                    else "r10_120m" if getattr(sig, "variant", "") == "R10_EXPLOSION_ONSET"
+                    "r11_trail"  if _is_r11
+                    else "time_300s" if _sig_variant == "R7_STAIRCASE"
+                    else "r10_120m" if _sig_variant == "R10_EXPLOSION_ONSET"
                     else "trail"
                 ),
             }
@@ -883,6 +887,7 @@ class LiveExecutor:
         self._log(
             "ENTRY", coin, actual_px,
             tier=tier,
+            variant=effective_variant,
             qty=round(filled_qty, 8),
             usd_size=round(filled_value, 4),
             buy_order=order_id,
