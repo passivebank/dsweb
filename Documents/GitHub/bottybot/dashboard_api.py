@@ -144,6 +144,13 @@ def parse_live_trades():
                 else:
                     variant = "legacy"
 
+            # Upgrade R7 → R11 when features match R11 entry gate (step_2m>=0.018, spread<=8bps).
+            # Applies to both new trades (explicit variant) and historical trades (inferred).
+            if variant == "R7_STAIRCASE":
+                if ((features.get("step_2m") or 0) >= 0.018 and
+                        (features.get("spread_bps") or 999) <= 8):
+                    variant = "R11_BIG_STAIRCASE"
+
             entry_ts = _get_field(entry or {}, "ts", "entry_ts", default="")
             entry_px = _get_field(entry or {}, "price", "entry_px", default=0)
 
