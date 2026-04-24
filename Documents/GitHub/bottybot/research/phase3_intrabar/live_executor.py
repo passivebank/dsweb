@@ -34,6 +34,16 @@ SLIP            = 0.0003  # used only for legacy-record qty estimation (reconcil
 MIN_ORDER_USD   = 10.0    # sub-$10 positions have negligible dollar P&L
 MAX_HOLD_S      = 14400   # 4h hard cap
 
+# ── Smart-exit (limit-then-market) parameters ──────────────────────────
+# On TIME_CAP we have no urgency to hit any specific price; place a maker
+# limit at best bid and wait briefly. If unfilled or partially filled,
+# market-sell the remainder. Empirical motivation: TIME_CAP market sells
+# in 2026-04 logs averaged +55 bps slippage (p90 +146 bps). A 30s maker
+# limit reclaims most of that on the typical case.
+TIME_CAP_LIMIT_WAIT_S = 30.0   # seconds to wait for limit fill
+TIME_CAP_LIMIT_POLL_S = 1.0    # seconds between status polls
+SMART_EXIT_VARIANTS   = {"TIME_CAP"}  # exit reasons that get smart-exit treatment
+
 # ── v10 entry filter gates ───────────────────────────────────────────
 GATE_ONSET_S     = 8.0    # diagnostic: edge collapses past 8s (0-8s: +0.73% gross, 8-31s: +0.19%)
 GATE_CVD_30S_MIN = -2000  # skip if net selling > $2000 in last 30s (18% WR vs 46%)
@@ -106,6 +116,24 @@ def _get_usd_balance(client) -> float:
         if not has_next or not cursor:
             break
     return 0.0
+
+
+def _get_best_bid_ask(client, coin: str) -> tuple:
+    """Fetch top-of-book for `coin`-USD.
+
+    Returns (best_bid, best_ask) as floats, or (None, None) on failure.
+    Used for: pre-submit slippage instrumentation, post-only limit pricing
+    on smart exits.
+    """
+    try:
+        resp = client.get_best_bid_ask(product_ids=[f"{coin}-USD"])
+        pb   = resp.pricebooks[0]
+        bid  = float(pb.bids[0].price) if pb.bids else None
+        ask  = float(pb.asks[0].price) if pb.asks else None
+        return bid, ask
+    except Exception as e:
+        log.warning(f"[BBO ERR] {coin}: {e}")
+        return None, None
 
 
 def _get_all_coin_balances(client) -> dict:
@@ -230,6 +258,107 @@ def _fetch_order_fill(client, order_id: str, coin: str, retries: int = 4) -> tup
     return 0.0, 0.0, 0.0
 
 
+def _place_limit_sell(client, coin: str, base_qty: float, limit_px: float) -> Optional[str]:
+    """Place a post-only LIMIT SELL. Returns order_id on success, else None.
+
+    post_only=True ensures the order rests on the book as a maker. If the
+    limit price would cross the spread the exchange rejects the order
+    rather than crossing as a taker — caller should fall through to a
+    market sell in that case.
+    """
+    cid = str(uuid.uuid4())
+    # Match precision similarly to _market_sell: try progressively coarser
+    # decimal places on the size on PRECISION rejects. Limit price uses 8dp
+    # which Coinbase accepts for all USD pairs we trade.
+    for decimals in (8, 4, 2, 1, 0):
+        factor = 10 ** decimals
+        floored = math.floor(base_qty * factor) / factor
+        if floored <= 0:
+            continue
+        qty_str = f"{floored:.{decimals}f}"
+        try:
+            resp = client.create_order(
+                client_order_id=cid,
+                product_id=f"{coin}-USD",
+                side="SELL",
+                order_configuration={
+                    "limit_limit_gtc": {
+                        "base_size":   qty_str,
+                        "limit_price": f"{limit_px:.8f}",
+                        "post_only":   True,
+                    }
+                },
+            )
+            if resp.success:
+                oid = resp.success_response["order_id"]
+                log.info(
+                    f"[LIMIT-SELL] {coin}  qty={qty_str}  px={limit_px:.8f}  oid={oid}"
+                )
+                return oid
+            err      = resp.error_response or {}
+            err_code = err.get("error", "") if isinstance(err, dict) else str(err)
+            if "PRECISION" in err_code or "INVALID_SIZE" in err_code:
+                log.warning(f"[LIMIT-SELL] {coin} precision retry: {decimals}dp → {err_code}")
+                continue
+            log.error(f"[LIMIT-SELL REJECT] {coin}: {err}")
+            return None
+        except Exception as e:
+            log.error(f"[LIMIT-SELL ERR] {coin}: {e}")
+            return None
+    return None
+
+
+def _get_order_status(client, order_id: str) -> tuple:
+    """Return (status_str, filled_size, filled_value) for an order.
+
+    status_str ∈ {"OPEN", "FILLED", "CANCELLED", "EXPIRED", "FAILED",
+                  "PARTIALLY_FILLED", "UNKNOWN"}
+    Coinbase represents fully-filled orders as status="FILLED" but during
+    the active window a limit may report status="OPEN" with filled_size>0
+    (partial fill). Callers should treat any filled_size>0 as money in
+    the bank regardless of status.
+    """
+    try:
+        resp  = client.get_order(order_id=order_id)
+        order = resp.order if hasattr(resp, "order") else resp
+        status       = str(getattr(order, "status", "UNKNOWN") or "UNKNOWN").upper()
+        filled_size  = float(getattr(order, "filled_size",  0) or 0)
+        filled_value = float(getattr(order, "filled_value", 0) or 0)
+        if filled_value == 0:
+            filled_value = float(getattr(order, "total_value_after_fees", 0) or 0)
+        # Coinbase normalisation: some SDK versions surface "DONE" instead of "FILLED"
+        if status == "DONE":
+            status = "FILLED" if filled_size > 0 else "CANCELLED"
+        return status, filled_size, filled_value
+    except Exception as e:
+        log.error(f"[STATUS ERR] {order_id}: {e}")
+        return "UNKNOWN", 0.0, 0.0
+
+
+def _cancel_order(client, order_id: str) -> bool:
+    """Cancel an order. Returns True if cancel was accepted.
+
+    A cancel can race with a fill — Coinbase will refuse to cancel a
+    fully-filled order. Caller is responsible for re-checking status
+    after a False return to disambiguate filled-vs-failed.
+    """
+    try:
+        resp = client.cancel_orders(order_ids=[order_id])
+        results = getattr(resp, "results", None) or []
+        if results:
+            r0 = results[0]
+            ok = bool(getattr(r0, "success", False))
+            if not ok:
+                fr = getattr(r0, "failure_reason", "")
+                log.warning(f"[CANCEL] {order_id} failed: {fr}")
+            return ok
+        # Some SDK shapes return the bool directly
+        return bool(getattr(resp, "success", False))
+    except Exception as e:
+        log.error(f"[CANCEL ERR] {order_id}: {e}")
+        return False
+
+
 def _market_sell(client, coin: str, base_qty: float, reason: str) -> Optional[str]:
     """Attempt sell, retrying with fewer decimal places on INVALID_SIZE_PRECISION.
 
@@ -291,6 +420,157 @@ def _market_sell(client, coin: str, base_qty: float, reason: str) -> Optional[st
         log.error(f"[SELL REJECT] {coin}: INSUFFICIENT_FUND even with real balance {real_qty}")
         return None
     return result
+
+
+def _smart_sell(client, coin: str, base_qty: float, reason: str, log_fn) -> dict:
+    """Limit-then-market exit. Place a post-only limit at best bid, wait
+    up to TIME_CAP_LIMIT_WAIT_S for fill, market-sell any remainder.
+
+    log_fn is the executor's `_log` bound method — used to emit
+    LIMIT_PLACED / LIMIT_FILL_PARTIAL / LIMIT_TIMEOUT / MARKET_FALLBACK
+    events into the trade log so the reconciler can see them.
+
+    Returns a dict:
+        {
+          "ok":           bool,    # True if any fill happened
+          "limit_oid":    str|None,
+          "market_oid":   str|None,
+          "filled_qty":   float,   # combined fill size
+          "filled_value": float,   # combined fill USD value (after fees)
+          "avg_fill_px":  float,
+          "path":         "limit_full" | "limit_partial+market" |
+                          "market_fallback" | "rejected",
+        }
+
+    On total failure (limit reject AND market reject), returns ok=False.
+    Caller is responsible for restoring position state in that case.
+    """
+    out = {
+        "ok": False, "limit_oid": None, "market_oid": None,
+        "filled_qty": 0.0, "filled_value": 0.0, "avg_fill_px": 0.0,
+        "path": "rejected",
+    }
+
+    bid, ask = _get_best_bid_ask(client, coin)
+    if bid is None:
+        # Without a bid we can't price a maker limit. Fall straight to market.
+        log.warning(f"[SMART-EXIT] {coin} no BBO — market fallback")
+        market_oid = _market_sell(client, coin, base_qty, reason)
+        if not market_oid:
+            return out
+        fq, fv, fpx = _fetch_order_fill(client, market_oid, coin)
+        out.update({
+            "ok": fq > 0, "market_oid": market_oid,
+            "filled_qty": fq, "filled_value": fv, "avg_fill_px": fpx,
+            "path": "market_fallback",
+        })
+        return out
+
+    # Place post-only limit at the best bid. The maker fills only when
+    # somebody crosses the spread to hit our price; we get a rebate.
+    limit_oid = _place_limit_sell(client, coin, base_qty, bid)
+    if not limit_oid:
+        # Limit rejected (post_only crossed, precision exhausted, or other).
+        # Fall through to market sell so the position still exits.
+        log.warning(f"[SMART-EXIT] {coin} limit rejected — market fallback")
+        market_oid = _market_sell(client, coin, base_qty, reason)
+        if not market_oid:
+            return out
+        fq, fv, fpx = _fetch_order_fill(client, market_oid, coin)
+        out.update({
+            "ok": fq > 0, "market_oid": market_oid,
+            "filled_qty": fq, "filled_value": fv, "avg_fill_px": fpx,
+            "path": "market_fallback",
+        })
+        return out
+
+    log_fn("LIMIT_PLACED", coin, bid,
+           order_id=limit_oid, qty=base_qty, reason=reason, intended_px=bid)
+
+    # Poll until filled or timeout.
+    deadline    = time.time() + TIME_CAP_LIMIT_WAIT_S
+    filled_size = 0.0
+    filled_val  = 0.0
+    last_status = "OPEN"
+    while time.time() < deadline:
+        time.sleep(TIME_CAP_LIMIT_POLL_S)
+        st, fs, fv = _get_order_status(client, limit_oid)
+        last_status, filled_size, filled_val = st, fs, fv
+        if st == "FILLED":
+            avg = (fv / fs) if fs > 0 else 0.0
+            log_fn("LIMIT_FILLED", coin, avg,
+                   order_id=limit_oid, qty=fs, value_usd=fv, reason=reason)
+            out.update({
+                "ok": True, "limit_oid": limit_oid,
+                "filled_qty": fs, "filled_value": fv, "avg_fill_px": avg,
+                "path": "limit_full",
+            })
+            return out
+        if st in ("CANCELLED", "EXPIRED", "FAILED"):
+            # Exchange-side termination before timeout — handle below
+            break
+
+    # Timeout or early termination. Cancel any remaining open quantity,
+    # then market-sell whatever's left.
+    if last_status == "OPEN":
+        cancelled = _cancel_order(client, limit_oid)
+        # Whether or not cancel succeeded, re-check status to settle on the
+        # final filled_size — a fill could have raced our cancel.
+        st, fs, fv = _get_order_status(client, limit_oid)
+        last_status, filled_size, filled_val = st, fs, fv
+        if not cancelled and st == "OPEN":
+            log.error(f"[SMART-EXIT] {coin} cancel failed and order still OPEN — "
+                      f"giving up to avoid double-sell. Manual intervention needed.")
+            out.update({"limit_oid": limit_oid, "path": "rejected"})
+            return out
+
+    remainder = max(0.0, base_qty - filled_size)
+    avg_limit = (filled_val / filled_size) if filled_size > 0 else 0.0
+    if filled_size > 0:
+        log_fn("LIMIT_FILL_PARTIAL", coin, avg_limit,
+               order_id=limit_oid, qty=filled_size, value_usd=filled_val, reason=reason)
+
+    if remainder <= 0 or remainder * (avg_limit or 1.0) < 1.0:
+        # Fully filled within tolerance, or remainder too small to bother.
+        out.update({
+            "ok": filled_size > 0, "limit_oid": limit_oid,
+            "filled_qty": filled_size, "filled_value": filled_val,
+            "avg_fill_px": avg_limit,
+            "path": "limit_full",
+        })
+        return out
+
+    # Market-sell the remainder.
+    log_fn("LIMIT_TIMEOUT", coin, bid,
+           order_id=limit_oid, remainder_qty=remainder, reason=reason)
+    market_oid = _market_sell(client, coin, remainder, reason)
+    if not market_oid:
+        # Market sell also failed. Report what filled so the position can be
+        # adjusted, but flag as not-ok so the caller restores state for the
+        # unfilled portion.
+        out.update({
+            "ok": filled_size > 0, "limit_oid": limit_oid,
+            "filled_qty": filled_size, "filled_value": filled_val,
+            "avg_fill_px": avg_limit,
+            "path": "limit_partial+market_fail",
+        })
+        return out
+
+    mq, mv, mpx = _fetch_order_fill(client, market_oid, coin)
+    log_fn("MARKET_FALLBACK", coin, mpx,
+           order_id=market_oid, qty=mq, value_usd=mv, reason=reason)
+
+    total_qty = filled_size + mq
+    total_val = filled_val  + mv
+    avg_px    = (total_val / total_qty) if total_qty > 0 else 0.0
+    out.update({
+        "ok": total_qty > 0,
+        "limit_oid": limit_oid, "market_oid": market_oid,
+        "filled_qty": total_qty, "filled_value": total_val,
+        "avg_fill_px": avg_px,
+        "path": "limit_partial+market" if filled_size > 0 else "market_fallback",
+    })
+    return out
 
 
 class LiveExecutor:
@@ -518,31 +798,50 @@ class LiveExecutor:
 
                 elif cmd == "sell":
                     _, coin, pos, trigger_px, reason = item
-                    oid = _market_sell(self._client, coin, pos["qty"], reason)
-                    if oid is None:
-                        # Sell failed — restore position so on_price keeps managing it
-                        # and will enqueue another sell attempt on the next price tick.
-                        with self._lock:
-                            if coin not in self._positions:
-                                self._positions[coin] = pos
-                        log.error(f"[SELL FAIL] {coin} — position RESTORED, will retry on next tick")
-                        continue
 
-                    # Verify the order actually filled — IOC orders can be accepted
-                    # then cancelled with zero fill (e.g. insufficient liquidity or
-                    # exchange-side reject after submission). If fill is zero the
-                    # position still exists on the exchange: restore it so on_price
-                    # keeps managing it and queues another sell on the next tick.
-                    filled_qty, _, fill_px = _fetch_order_fill(self._client, oid, coin)
-                    if filled_qty <= 0:
-                        with self._lock:
-                            if coin not in self._positions:
-                                self._positions[coin] = pos
-                        log.error(
-                            f"[SELL CANCELLED] {coin} order {oid} — accepted but"
-                            f" zero fill; position RESTORED, will retry on next tick"
+                    # Smart-exit (limit-then-market) for TIME_CAP. TRAIL_STOP keeps
+                    # the existing market path — trail stops are urgency-driven
+                    # and we don't want a 30s wait while price falls further.
+                    use_smart = reason in SMART_EXIT_VARIANTS
+                    if use_smart:
+                        result = _smart_sell(
+                            self._client, coin, pos["qty"], reason, self._log,
                         )
-                        continue
+                        oid        = result["limit_oid"] or result["market_oid"]
+                        filled_qty = result["filled_qty"]
+                        fill_px    = result["avg_fill_px"]
+                        if not result["ok"]:
+                            with self._lock:
+                                if coin not in self._positions:
+                                    self._positions[coin] = pos
+                            log.error(
+                                f"[SMART-EXIT FAIL] {coin} path={result['path']} "
+                                f"— position RESTORED, will retry on next tick"
+                            )
+                            continue
+                    else:
+                        oid = _market_sell(self._client, coin, pos["qty"], reason)
+                        if oid is None:
+                            # Sell failed — restore position so on_price keeps
+                            # managing it and enqueues another attempt next tick.
+                            with self._lock:
+                                if coin not in self._positions:
+                                    self._positions[coin] = pos
+                            log.error(f"[SELL FAIL] {coin} — position RESTORED, will retry on next tick")
+                            continue
+                        # Verify the order actually filled — IOC orders can be
+                        # accepted then cancelled with zero fill.
+                        filled_qty, _, fill_px = _fetch_order_fill(self._client, oid, coin)
+                        if filled_qty <= 0:
+                            with self._lock:
+                                if coin not in self._positions:
+                                    self._positions[coin] = pos
+                            log.error(
+                                f"[SELL CANCELLED] {coin} order {oid} — accepted but"
+                                f" zero fill; position RESTORED, will retry on next tick"
+                            )
+                            continue
+
                     actual_exit_px = fill_px if fill_px > 0 else trigger_px
                     gain     = actual_exit_px / pos["entry_px"] - 1.0
                     hold_min = (time.time() - pos["entry_ts"]) / 60.0
@@ -559,6 +858,7 @@ class LiveExecutor:
                         hold_min=round(hold_min, 1),
                         tier=pos["tier"],
                         half_sold=half_sold,   # needed for correct cooldown key at reconcile
+                        exit_path=("smart" if reason in SMART_EXIT_VARIANTS else "market"),
                     )
                     # Classify exit and arm the per-coin cooldown gate
                     if reason == "TRAIL_STOP":
@@ -831,6 +1131,10 @@ class LiveExecutor:
             log.warning(f"[SKIP] {coin} — position size {usd_size:.2f} < min {MIN_ORDER_USD}")
             return
 
+        # Capture intended entry price (best ask) immediately before the buy
+        # so we can measure entry-leg slippage post-fill. None on BBO failure.
+        _bid_at_submit, intended_px = _get_best_bid_ask(self._client, coin)
+
         # Capture order submission time BEFORE the API call so entry_ts reflects
         # when the order was placed, not when the fill was confirmed.
         order_ts = time.time()
@@ -900,6 +1204,7 @@ class LiveExecutor:
             order_id=order_id,
             qty=round(filled_qty, 8),
             value_usd=round(filled_value, 4),
+            intended_px=intended_px,
         )
         extra = {"fill_warn": True} if fill_warn else {}
         self._log(
@@ -913,6 +1218,7 @@ class LiveExecutor:
             pos_pct=pos_pct,
             ev_score=ev_score,
             ev_scale=ev_scale,
+            intended_px=intended_px,
             features=sig.features,
             **extra,
         )
@@ -932,6 +1238,12 @@ class LiveExecutor:
         """
         if not self._trade_log.exists():
             log.info("[RECONCILE] no trade log — starting fresh")
+            # Even with no log, sweep the exchange for stranded SELL orders so
+            # a fresh process never inherits a half-open exit from a prior life.
+            try:
+                self._cancel_stranded_sells()
+            except Exception as e:
+                log.error(f"[RECONCILE] stranded-sell cleanup failed: {e}")
             return
 
         try:
@@ -1042,6 +1354,16 @@ class LiveExecutor:
         # Any coin with a non-empty stack has an open position
         open_pos = {coin: entries[-1]
                     for coin, entries in stacks.items() if entries}
+
+        # Cancel any open SELL orders left behind by a crashed prior session.
+        # If a smart-exit was mid-flight when the service died, its limit order
+        # may still rest on Coinbase. Without cancelling it the new session
+        # would manage the same position twice (its own trail + the leftover
+        # limit). Cancel everything; the new session re-issues exits as needed.
+        try:
+            self._cancel_stranded_sells()
+        except Exception as e:
+            log.error(f"[RECONCILE] stranded-sell cleanup failed: {e}")
 
         # Second pass: restore _last_exit from the most recent EXIT per coin so
         # cooldowns survive service restarts.
@@ -1219,6 +1541,45 @@ class LiveExecutor:
                 self._positions[coin] = orphan_pos
 
         log.info(f"[RECONCILE] balance sweep complete — exchange has {len(cb_balances)} non-USD coin(s)")
+
+    def _cancel_stranded_sells(self) -> None:
+        """List all open orders on Coinbase and cancel any open SELLs.
+
+        Run during reconciliation. Any open SELL order at this point is from
+        a prior session that crashed mid-exit (smart-exit limit, partially
+        filled, etc.) — leaving it active would race the new session's
+        exit logic. Cancelling all open SELLs is conservative and safe:
+        the new session will re-issue exits via on_price as needed.
+        """
+        try:
+            resp = self._client.list_orders(order_status="OPEN")
+            orders = list(getattr(resp, "orders", []) or [])
+        except Exception as e:
+            log.error(f"[RECONCILE] list_orders failed: {e}")
+            return
+
+        cancelled = 0
+        for o in orders:
+            side = str(getattr(o, "side", "") or "").upper()
+            if side != "SELL":
+                continue
+            oid = getattr(o, "order_id", None)
+            pid = getattr(o, "product_id", "")
+            if not oid:
+                continue
+            ok = _cancel_order(self._client, oid)
+            if ok:
+                log.warning(
+                    f"[RECONCILE] cancelled stranded SELL {pid} order_id={oid}"
+                )
+                cancelled += 1
+            else:
+                log.error(
+                    f"[RECONCILE] FAILED to cancel stranded SELL {pid} "
+                    f"order_id={oid} — manual intervention may be required"
+                )
+        if cancelled:
+            log.info(f"[RECONCILE] cancelled {cancelled} stranded SELL order(s)")
 
     def _refresh_balance(self) -> None:
         """Refresh USD balance cache. Thread-safe; TTL-gated to avoid hammering the API."""

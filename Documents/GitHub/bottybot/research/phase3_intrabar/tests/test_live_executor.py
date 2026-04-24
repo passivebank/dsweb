@@ -99,18 +99,48 @@ def _make_order_response(order_id: str, success: bool = True,
 
 
 def _make_fill_response(order_id: str, filled_size: float,
-                         filled_value: float) -> MagicMock:
+                         filled_value: float, status: str = "FILLED") -> MagicMock:
     resp = MagicMock()
     order = MagicMock()
-    order.filled_size  = str(filled_size)
-    order.filled_value = str(filled_value)
+    order.filled_size            = str(filled_size)
+    order.filled_value           = str(filled_value)
+    order.total_value_after_fees = str(filled_value)
+    order.status                 = status
     resp.order = order
+    return resp
+
+
+def _make_bbo_response(bid: float = None, ask: float = None) -> MagicMock:
+    """Build a fake get_best_bid_ask response."""
+    pb = MagicMock()
+    pb.bids = [MagicMock(price=str(bid))] if bid is not None else []
+    pb.asks = [MagicMock(price=str(ask))] if ask is not None else []
+    resp = MagicMock()
+    resp.pricebooks = [pb]
+    return resp
+
+
+def _make_list_orders_response(*orders) -> MagicMock:
+    resp = MagicMock()
+    resp.orders = list(orders)
+    return resp
+
+
+def _make_cancel_response(success: bool = True) -> MagicMock:
+    resp = MagicMock()
+    r0 = MagicMock()
+    r0.success = success
+    r0.failure_reason = "" if success else "ALREADY_FILLED"
+    resp.results = [r0]
     return resp
 
 
 def _make_executor(tmp_path: Path, client: MagicMock) -> LiveExecutor:
     """Build a LiveExecutor with a mocked client, bypassing _make_client."""
     trade_log = tmp_path / "live_trades.jsonl"
+    # Default: no stranded sells found at startup. Tests that care can override.
+    if not getattr(client.list_orders, "_pretend_set", False):
+        client.list_orders.return_value = _make_list_orders_response()
     with patch.object(le, "_make_client", return_value=client):
         ex = LiveExecutor(trade_log)
     return ex
@@ -828,7 +858,7 @@ class TestTradingLogicUnchanged:
         assert GATE_CVD_30S_MIN == -2000
 
     def test_onset_gate_constant(self):
-        assert GATE_ONSET_S == pytest.approx(15.0)
+        assert GATE_ONSET_S == pytest.approx(8.0)
 
     def test_cooldown_values(self):
         assert COOLDOWN_S["TRAIL_STOP_FULL"]    == 90 * 60
@@ -1180,9 +1210,15 @@ class TestReconcileReliability:
         assert exit_recs, "EXIT record must be written for immediately-exited position"
         assert exit_recs[0]["reason"] == "TRAIL_STOP"
 
-    def test_reconcile_immediate_time_cap_exit(self, tmp_path):
+    def test_reconcile_immediate_time_cap_exit(self, tmp_path, monkeypatch):
         """If hold time already exceeds MAX_HOLD_S at startup, reconciler must queue
-        an immediate TIME_CAP sell."""
+        an immediate TIME_CAP sell.
+
+        TIME_CAP exits go through the smart-exit (limit-then-market) path. We
+        speed up the poll for test responsiveness; production polling cadence
+        is 1s × 30s window.
+        """
+        monkeypatch.setattr(le, "TIME_CAP_LIMIT_POLL_S", 0.05)
         entry_px    = 1.00
         # Entry logged 5 hours ago (past 4h cap)
         old_unix_ts = time.time() - (5 * 3600)
@@ -1195,9 +1231,7 @@ class TestReconcileReliability:
             _make_account("USD", 100.0)
         )
         # Price flat — trail stop not triggered, but hold time is way over cap
-        client.get_best_bid_ask.return_value = MagicMock(
-            pricebooks=[MagicMock(bids=[MagicMock(price="1.00")])]
-        )
+        client.get_best_bid_ask.return_value = _make_bbo_response(bid=1.00, ask=1.001)
         client.create_order.return_value = _make_order_response("oid-aged-sell")
         client.get_order.return_value    = _make_fill_response("oid-aged-sell", 10.0, 1.00)
 
@@ -1207,9 +1241,220 @@ class TestReconcileReliability:
             assert "AGED" not in ex._positions, \
                 "Position past TIME_CAP should not be in _positions"
 
-        time.sleep(0.3)
+        time.sleep(0.5)
         log_lines = (tmp_path / "live_trades.jsonl").read_text().splitlines()
         records   = [json.loads(l) for l in log_lines]
         exit_recs = [r for r in records if r.get("event") == "EXIT" and r.get("coin") == "AGED"]
         assert exit_recs, "EXIT record must be written for time-capped position at startup"
         assert exit_recs[0]["reason"] == "TIME_CAP"
+
+
+# ---------------------------------------------------------------------------
+# Smart-exit (limit-then-market) — TIME_CAP path
+# ---------------------------------------------------------------------------
+
+class TestSmartSell:
+    """Unit tests for the _smart_sell orchestrator.
+
+    Exercises the four observable paths:
+      1. limit_full          — limit fills entirely within window
+      2. limit_partial+market — limit partially fills, market sells remainder
+      3. market_fallback     — limit rejected outright (post_only crossed),
+                                or BBO unavailable
+      4. rejected            — both limit and market fail; caller restores
+    """
+
+    def _client_with_bbo(self, bid=1.0, ask=1.001):
+        c = MagicMock()
+        c.get_best_bid_ask.return_value = _make_bbo_response(bid=bid, ask=ask)
+        return c
+
+    def _log_sink(self):
+        """A simple log_fn capturing emitted events into a list."""
+        events: list = []
+
+        def _log(event, coin, price, **kw):
+            events.append({"event": event, "coin": coin, "price": price, **kw})
+
+        return events, _log
+
+    def test_smart_sell_full_limit_fill(self):
+        client = self._client_with_bbo(bid=1.0)
+        client.create_order.return_value = _make_order_response("oid-limit")
+        client.get_order.return_value    = _make_fill_response("oid-limit", 10.0, 10.0)
+        events, log_fn = self._log_sink()
+
+        with patch.object(le, "TIME_CAP_LIMIT_POLL_S", 0.01):
+            r = le._smart_sell(client, "X", 10.0, "TIME_CAP", log_fn)
+
+        assert r["ok"] is True
+        assert r["path"] == "limit_full"
+        assert r["limit_oid"]  == "oid-limit"
+        assert r["market_oid"] is None
+        assert r["filled_qty"] == 10.0
+        assert r["avg_fill_px"] == 1.0
+        # Log events: LIMIT_PLACED then LIMIT_FILLED
+        kinds = [e["event"] for e in events]
+        assert kinds == ["LIMIT_PLACED", "LIMIT_FILLED"]
+
+    def test_smart_sell_timeout_then_market(self):
+        """Limit never fills; on timeout, cancel and market-sell the full size."""
+        client = self._client_with_bbo(bid=1.0)
+        # First create_order is the limit; second is the market fallback.
+        client.create_order.side_effect = [
+            _make_order_response("oid-limit"),
+            _make_order_response("oid-market"),
+        ]
+        # WAIT=0.005s with POLL=0.01s → exactly one poll fires before deadline.
+        # Sequence: poll #1 (OPEN), post-cancel recheck (CANCELLED), market fill.
+        client.get_order.side_effect = [
+            _make_fill_response("oid-limit",  0.0, 0.0,  status="OPEN"),
+            _make_fill_response("oid-limit",  0.0, 0.0,  status="CANCELLED"),
+            _make_fill_response("oid-market", 10.0, 9.9, status="FILLED"),
+        ]
+        client.cancel_orders.return_value = _make_cancel_response(success=True)
+        events, log_fn = self._log_sink()
+
+        with patch.multiple(le,
+                             TIME_CAP_LIMIT_POLL_S=0.01,
+                             TIME_CAP_LIMIT_WAIT_S=0.005):
+            r = le._smart_sell(client, "X", 10.0, "TIME_CAP", log_fn)
+
+        assert r["ok"] is True
+        assert r["path"] == "market_fallback"
+        assert r["limit_oid"]  == "oid-limit"
+        assert r["market_oid"] == "oid-market"
+        assert r["filled_qty"] == 10.0
+        assert r["filled_value"] == 9.9
+        kinds = [e["event"] for e in events]
+        assert "LIMIT_PLACED"    in kinds
+        assert "LIMIT_TIMEOUT"   in kinds
+        assert "MARKET_FALLBACK" in kinds
+
+    def test_smart_sell_partial_fill_then_market(self):
+        """Limit partially fills during the wait; remainder goes via market."""
+        client = self._client_with_bbo(bid=1.0)
+        client.create_order.side_effect = [
+            _make_order_response("oid-limit"),
+            _make_order_response("oid-market"),
+        ]
+        # Sequence: poll #1 (OPEN, 4 filled), post-cancel recheck (CANCELLED, 4 filled),
+        # market fill for remainder.
+        client.get_order.side_effect = [
+            _make_fill_response("oid-limit",  4.0, 4.0,  status="OPEN"),
+            _make_fill_response("oid-limit",  4.0, 4.0,  status="CANCELLED"),
+            _make_fill_response("oid-market", 6.0, 5.88, status="FILLED"),
+        ]
+        client.cancel_orders.return_value = _make_cancel_response(success=True)
+        events, log_fn = self._log_sink()
+
+        with patch.multiple(le,
+                             TIME_CAP_LIMIT_POLL_S=0.01,
+                             TIME_CAP_LIMIT_WAIT_S=0.005):
+            r = le._smart_sell(client, "X", 10.0, "TIME_CAP", log_fn)
+
+        assert r["ok"] is True
+        assert r["path"] == "limit_partial+market"
+        assert r["filled_qty"]   == pytest.approx(10.0)
+        assert r["filled_value"] == pytest.approx(9.88)
+        kinds = [e["event"] for e in events]
+        assert "LIMIT_PLACED"        in kinds
+        assert "LIMIT_FILL_PARTIAL"  in kinds
+        assert "LIMIT_TIMEOUT"       in kinds
+        assert "MARKET_FALLBACK"     in kinds
+
+    def test_smart_sell_no_bbo_falls_through_to_market(self):
+        """No bid available → straight to market sell."""
+        client = MagicMock()
+        # No bids → _get_best_bid_ask returns (None, None)
+        client.get_best_bid_ask.return_value = _make_bbo_response(bid=None, ask=None)
+        client.create_order.return_value = _make_order_response("oid-market")
+        client.get_order.return_value    = _make_fill_response("oid-market", 10.0, 9.9)
+        events, log_fn = self._log_sink()
+
+        r = le._smart_sell(client, "X", 10.0, "TIME_CAP", log_fn)
+
+        assert r["ok"] is True
+        assert r["path"] == "market_fallback"
+        assert r["limit_oid"]  is None
+        assert r["market_oid"] == "oid-market"
+
+    def test_smart_sell_total_failure_returns_not_ok(self):
+        """Limit reject AND market reject → ok=False so caller restores position."""
+        client = self._client_with_bbo(bid=1.0)
+        client.create_order.return_value = _make_order_response(
+            "x", success=False, error_code="UNKNOWN_ERROR")
+        events, log_fn = self._log_sink()
+
+        r = le._smart_sell(client, "X", 10.0, "TIME_CAP", log_fn)
+
+        assert r["ok"] is False
+        assert r["filled_qty"] == 0.0
+        # No LIMIT_PLACED event when the limit submission was rejected
+        assert all(e["event"] != "LIMIT_PLACED" for e in events)
+
+
+class TestStrandedSellCancel:
+    """Verify reconciliation cancels open SELL orders left over from a crash."""
+
+    def test_cancels_open_sell_at_startup(self, tmp_path):
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        # One stranded SELL on the books for FOO.
+        stranded = MagicMock()
+        stranded.order_id   = "stranded-1"
+        stranded.product_id = "FOO-USD"
+        stranded.side       = "SELL"
+        unrelated = MagicMock()
+        unrelated.order_id   = "ignore-1"
+        unrelated.product_id = "BTC-USD"
+        unrelated.side       = "BUY"
+        client.list_orders.return_value = _make_list_orders_response(stranded, unrelated)
+        client.cancel_orders.return_value = _make_cancel_response(success=True)
+
+        ex = _make_executor(tmp_path, client)
+
+        # The cancel call list contains stranded-1 but not ignore-1.
+        cancel_calls = [
+            c.kwargs.get("order_ids") or (c.args[0] if c.args else None)
+            for c in client.cancel_orders.mock_calls
+        ]
+        flat = [oid for entry in cancel_calls if entry for oid in entry]
+        assert "stranded-1" in flat
+        assert "ignore-1"  not in flat
+
+
+class TestEntryLoggingIntendedPx:
+    """ENTRY/FILL events must carry intended_px for slippage measurement."""
+
+    def test_entry_record_includes_intended_px(self, tmp_path):
+        client = MagicMock()
+        client.get_accounts.return_value = _make_accounts_response(
+            _make_account("USD", 100.0)
+        )
+        client.get_best_bid_ask.return_value = _make_bbo_response(bid=0.99, ask=1.005)
+        client.create_order.return_value = _make_order_response("oid-buy")
+        client.get_order.return_value    = _make_fill_response("oid-buy", 10.0, 10.07)
+
+        ex = _make_executor(tmp_path, client)
+
+        sig = FakeSignal(coin="ZZ", variant="R7_STAIRCASE")
+        sig.features.update({
+            "rank_60s": 1, "cg_trending": False, "market_breadth_5m": 5,
+            "signals_24h": 5,
+            # step_2m below R11 threshold (0.018) so we take the standard R7 path
+            # without the extra higher_lows_3m / cvd>0 gates.
+            "step_2m": 0.012, "candle_close_str_1m": 0.9,
+            "btc_rel_ret_5m": 0.05, "first_signal_today": True,
+        })
+        ex.on_signal(sig)
+        time.sleep(0.4)
+
+        records = [json.loads(l) for l in
+                   (tmp_path / "live_trades.jsonl").read_text().splitlines()]
+        entries = [r for r in records if r.get("event") == "ENTRY"]
+        assert entries, "ENTRY record must be written"
+        # intended_px is the best ask captured before submission.
+        assert entries[0].get("intended_px") == pytest.approx(1.005)
