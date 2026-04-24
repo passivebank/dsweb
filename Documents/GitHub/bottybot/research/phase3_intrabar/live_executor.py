@@ -381,6 +381,19 @@ class LiveExecutor:
                 trail = TRAIL_PRE
             stop_px  = pos["peak_px"] * (1 - trail)
 
+            # R11 positions: 0.3% fixed trail from peak, 1.5% hard stop from entry, 5m cap
+            # N=1,527 shadow: WR=76.9% EV=+2.67% CI=[+2.41,+2.93]% (incl 0.4% friction)
+            if pos.get("exit_policy") == "r11_trail":
+                hard_stop_px = pos["entry_px"] * 0.985   # 1.5% from entry
+                trail_px     = pos["peak_px"]  * 0.997   # 0.3% from peak
+                if hold_s >= 300:
+                    self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
+                    del self._positions[coin]
+                elif price <= hard_stop_px or price <= trail_px:
+                    self._q.put(("sell", coin, pos.copy(), price, "TRAIL_STOP"))
+                    del self._positions[coin]
+                return
+
             # R7 positions: fixed 5-min hold, 1% hard stop from entry (N=23k: +0.148% EV)
             if pos.get("exit_policy") == "time_300s":
                 if hold_s >= 300:
@@ -574,6 +587,11 @@ class LiveExecutor:
         """
         if getattr(sig, "variant", "") == "R10_EXPLOSION_ONSET":
             return 13.4  # backtest-validated EV (N=2, WR=100%, false-pos filtered)
+        # R11: Big Staircase — strong step_2m on liquid coin (N=1527, CI=[+2.41,+2.93]%)
+        if (getattr(sig, "variant", "") == "R7_STAIRCASE" and
+                (sig.features.get("step_2m", 0) or 0) >= 0.018 and
+                (sig.features.get("spread_bps", 999) or 999) <= 8):
+            return 2.67
         f    = sig.features
         tier = f.get("confidence_tier", "D")
         ev   = float(TIER_EV_BASELINE.get(tier, 3.2))
@@ -691,9 +709,15 @@ class LiveExecutor:
             log.info(f"[SKIP] {coin} variant={variant} not approved")
             return
 
+        _s2m = (sig.features.get("step_2m", 0) or 0)
+        _spd = (sig.features.get("spread_bps", 999) or 999)
+        _r11 = (variant == "R7_STAIRCASE" and _s2m >= 0.018 and _spd <= 8)
+
         if variant == "R10_EXPLOSION_ONSET":
             # R10 bypasses rank/breadth/CVD precision stack — designed for non-rank-1 runners
             log.info(f"[R10] {coin} explosion onset — dv5m={sig.features.get('dv_5m_usd',0):,.0f} trend={sig.features.get('dv_trend_5m',0):.1f}x")
+        elif _r11:
+            log.info(f"[R11] {coin} big staircase step_2m={_s2m:.4f} spread={_spd:.1f}bps")
         else:
             if sig.features.get("rank_60s", 99) != 1:
                 log.info(f"[SKIP] {coin} rank not 1")
@@ -708,7 +732,7 @@ class LiveExecutor:
             if sig.features.get("signals_24h", 0) > 15:
                 log.info(f"[SKIP] {coin} signals_24h too high")
                 return
-        if variant == "R7_STAIRCASE":
+        if variant == "R7_STAIRCASE" and not _r11:
             if sig.features.get("step_2m", 0) <= 0.008:
                 log.info(f"[SKIP] {coin} R7 step_2m weak")
                 return
@@ -832,7 +856,14 @@ class LiveExecutor:
                 "usd_in":    filled_value,
                 "buy_order": order_id,
                 "pos_pct":   pos_pct,
-                "exit_policy": "time_300s" if getattr(sig, "variant", "") == "R7_STAIRCASE" else ("r10_120m" if getattr(sig, "variant", "") == "R10_EXPLOSION_ONSET" else "trail"),
+                "exit_policy": (
+                    "r11_trail" if (getattr(sig, "variant", "") == "R7_STAIRCASE" and
+                                    (sig.features.get("step_2m", 0) or 0) >= 0.018 and
+                                    (sig.features.get("spread_bps", 999) or 999) <= 8)
+                    else "time_300s" if getattr(sig, "variant", "") == "R7_STAIRCASE"
+                    else "r10_120m" if getattr(sig, "variant", "") == "R10_EXPLOSION_ONSET"
+                    else "trail"
+                ),
             }
         log.info(
             f"[ENTRY] {coin} Tier={tier} ev={ev_score:.1f}% pos={pos_pct:.0%} "
