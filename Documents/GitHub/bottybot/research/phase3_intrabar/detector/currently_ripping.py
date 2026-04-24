@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .state import CoinState, NS
+import time as _time
+_r7_miss_throttle: dict = {}
 
 
 @dataclass
@@ -507,7 +509,17 @@ def check_r6_local_breakout(state: CoinState, now_ns: int,
 # must show positive return above a minimum threshold to exclude noise.
 R7_RET_24H_MIN   = 0.12    # already up 12%+ today (was 5% — far too loose)
 R7_STEP_MIN_PCT  = 0.003   # each 60s step must be up ≥ 0.3%
-R7_TOP_K_RANK    = 10
+R7_TOP_K_RANK    = 5   # data: rank 6-10 EV=-0.179% (n=133); rank 1-5 EV=+0.623% (n=5176)
+
+
+def _r7_miss(coin, reason, rank, ret24h, **kw):
+    """Print R7 near-miss once per 60s per coin to avoid log spam."""
+    now = _time.monotonic()
+    if now - _r7_miss_throttle.get(coin, 0) < 60:
+        return
+    _r7_miss_throttle[coin] = now
+    extras = "  ".join(f"{k}={v}" for k, v in kw.items())
+    print(f"[r7-miss] {coin}  rank={rank}  ret24h={ret24h:.3f}  {reason}  {extras}", flush=True)
 
 
 def check_r7_staircase(state: CoinState, now_ns: int,
@@ -515,11 +527,19 @@ def check_r7_staircase(state: CoinState, now_ns: int,
                        ret_24h: float,
                        spread_bps: float = 0.0) -> Optional[SignalEvent]:
     """Fires when the coin has posted 3 consecutive positive 1-min returns."""
-    if spread_bps > state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION):
+    coin = state.coin
+    dyn_gate = state.dynamic_spread_gate(SPREAD_FLOOR_BPS, SPREAD_CAP_BPS, SPREAD_COMPRESSION)
+    if spread_bps > dyn_gate:
+        if rank_60s is not None and rank_60s <= R7_TOP_K_RANK and ret_24h >= R7_RET_24H_MIN:
+            _r7_miss(coin, "spread>gate", rank_60s, ret_24h,
+                     spread=f"{spread_bps:.1f}", gate=f"{dyn_gate:.1f}")
         return None
     if rank_60s is None or rank_60s > R7_TOP_K_RANK:
+        if ret_24h >= R7_RET_24H_MIN:
+            _r7_miss(coin, "rank>5", rank_60s, ret_24h)
         return None
     if ret_24h < R7_RET_24H_MIN:
+        _r7_miss(coin, "ret24h<min", rank_60s, ret_24h, threshold=f"{R7_RET_24H_MIN:.2f}")
         return None
 
     # Measure 3 sequential 60s windows ending at now
@@ -530,9 +550,12 @@ def check_r7_staircase(state: CoinState, now_ns: int,
         mid_end   = state.mid_at_or_before(end_ns)
         mid_start = state.mid_at_or_before(start_ns)
         if mid_start <= 0 or mid_end <= 0:
+            _r7_miss(coin, f"no_price_window{i}", rank_60s, ret_24h)
             return None
         step_ret = (mid_end / mid_start) - 1.0
         if step_ret < R7_STEP_MIN_PCT:
+            _r7_miss(coin, f"step{i}_weak", rank_60s, ret_24h,
+                     step=f"{step_ret:.4f}", min=f"{R7_STEP_MIN_PCT:.3f}")
             return None
         steps.append(round(step_ret, 5))
 
