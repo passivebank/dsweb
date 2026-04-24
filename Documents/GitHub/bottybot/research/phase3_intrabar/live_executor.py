@@ -717,7 +717,17 @@ class LiveExecutor:
             # R10 bypasses rank/breadth/CVD precision stack — designed for non-rank-1 runners
             log.info(f"[R10] {coin} explosion onset — dv5m={sig.features.get('dv_5m_usd',0):,.0f} trend={sig.features.get('dv_trend_5m',0):.1f}x")
         elif _r11:
-            log.info(f"[R11] {coin} big staircase step_2m={_s2m:.4f} spread={_spd:.1f}bps")
+            # R12 gate: R11 criteria PLUS higher_lows_3m AND cvd_30s>0
+            # Backtest T40: WR=76%, EV=+0.794%, n=335 (vs R11 WR=62%, n=1,379)
+            _hl3m  = sig.features.get("higher_lows_3m")
+            _cvd30 = float(sig.features.get("cvd_30s", 0) or 0)
+            if _hl3m is None:
+                log.warning(f"[SKIP] {coin} R11: higher_lows_3m not in features — cannot evaluate R12 gate")
+                return
+            if _hl3m is not True or _cvd30 <= 0:
+                log.info(f"[SKIP] {coin} R11 no R12: higher_lows_3m={_hl3m} cvd_30s={_cvd30:.0f}")
+                return
+            log.info(f"[R12] {coin} step_2m={_s2m:.4f} spread={_spd:.1f}bps higher_lows=True cvd={_cvd30:.0f}")
         else:
             if sig.features.get("rank_60s", 99) != 1:
                 log.info(f"[SKIP] {coin} rank not 1")
@@ -739,6 +749,15 @@ class LiveExecutor:
             if sig.features.get("candle_close_str_1m", 0) <= 0.70:
                 log.info(f"[SKIP] {coin} R7 candle_close_str weak")
                 return
+
+        # BTC macro filter: require BTC lifting relative to market for all R7 entries
+        # Backtest showed btc_rel_ret_5m >= 0.02 materially improves R7 entry quality
+        if variant == "R7_STAIRCASE":
+            _btc_rel = sig.features.get("btc_rel_ret_5m")
+            if _btc_rel is not None and _btc_rel < 0.02:
+                log.info(f"[SKIP] {coin} R7 btc_rel_ret_5m={_btc_rel:.4f} < 0.02 — BTC macro filter")
+                return
+
         if variant == "R5_CONFIRMED_RUN":
             if sig.features.get("dv_trend", 0) <= 2.0:
                 log.info(f"[SKIP] {coin} R5 dv_trend low")
@@ -749,6 +768,12 @@ class LiveExecutor:
             spread_bps = sig.features.get("spread_bps", 0)
             if not (5 <= spread_bps < 10):
                 log.info(f"[SKIP] {coin} R5 spread={spread_bps:.1f} not 5-10bps")
+                return
+            # R5 momentum gate: only take surge entries (>=5%), not consolidation
+            # Backtest T33: R5 + ret_5m>=0.05 → EV=+0.379%, WR=41%, n=2,124
+            _r5m = float(sig.features.get("ret_5m", 0) or 0)
+            if _r5m < 0.05:
+                log.info(f"[SKIP] {coin} R5 ret_5m={_r5m:.4f} < 0.05 — momentum gate")
                 return
 
         # Per-coin cooldown gate: if this coin recently stopped us out or timed out at a
@@ -849,7 +874,8 @@ class LiveExecutor:
         _is_r11 = (_sig_variant == "R7_STAIRCASE" and
                    (sig.features.get("step_2m", 0) or 0) >= 0.018 and
                    (sig.features.get("spread_bps", 999) or 999) <= 8)
-        effective_variant = "R11_BIG_STAIRCASE" if _is_r11 else _sig_variant
+        # If _is_r11 here, R12 gates (higher_lows_3m + cvd_30s>0) already passed in _handle_entry
+        effective_variant = "R12_PRECISION" if _is_r11 else _sig_variant
 
         with self._lock:
             self._positions[coin] = {

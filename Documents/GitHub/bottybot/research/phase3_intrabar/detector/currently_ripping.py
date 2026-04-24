@@ -592,7 +592,7 @@ R8_RET_24H_MIN       = 0.15    # major mover — up 15%+ today
 R8_STEP_MIN_PCT      = 0.005   # each 60s step ≥ 0.5% (stronger than R7's 0.3%)
 R8_STEP_2M_MIN       = 0.008   # middle step ≥ 0.8% — confirms acceleration
 R8_DV_TREND_MIN      = 0.90    # volume holding (not fading)
-R8_WHALE_PCT_MIN     = 0.05    # at least 5% of 60s volume from large trades
+R8_WHALE_PCT_MIN     = 0.50    # >=50% of 60s volume from large trades (T02: +1.227% EV, 57% WR, n=214)
 R8_TOP_K_RANK        = 5       # top 5 only
 R8_LARGE_TRADE_USD   = 5_000   # threshold for "large trade" (same as state default)
 
