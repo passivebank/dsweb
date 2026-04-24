@@ -381,10 +381,13 @@ class LiveExecutor:
                 trail = TRAIL_PRE
             stop_px  = pos["peak_px"] * (1 - trail)
 
-            # R7 positions: fixed 5-min hold — skip trail/T8/partial
+            # R7 positions: fixed 5-min hold, 1% hard stop from entry (N=23k: +0.148% EV)
             if pos.get("exit_policy") == "time_300s":
                 if hold_s >= 300:
                     self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
+                    del self._positions[coin]
+                elif price <= pos["entry_px"] * 0.99:
+                    self._q.put(("sell", coin, pos.copy(), price, "TRAIL_STOP"))
                     del self._positions[coin]
                 return
 
