@@ -1,0 +1,19 @@
+[Unit]
+Description=Runner DNA — score all challengers + maybe-promote champion
+After=network-online.target cb_recorder.service
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/phase3_intrabar
+Environment=PYTHONUNBUFFERED=1
+Environment=SHADOW_TRADES_PATH=/home/ec2-user/phase3_intrabar/artifacts/shadow_trades.jsonl
+Environment=CHALLENGER_SCORES_PATH=/home/ec2-user/phase3_intrabar/artifacts/challenger_scores.json
+Environment=LIVE_FILTER_CONFIG=/home/ec2-user/phase3_intrabar/live_filter_config.json
+ExecStart=/home/ec2-user/phase3_intrabar/venv/bin/python -m research.runner_dna.score_challengers --window-days 7
+ExecStart=/home/ec2-user/phase3_intrabar/venv/bin/python -m research.runner_dna.auto_promote
+StandardOutput=append:/home/ec2-user/phase3_intrabar/artifacts/runner_dna_loop.log
+StandardError=append:/home/ec2-user/phase3_intrabar/artifacts/runner_dna_loop.log
+
+[Install]
+WantedBy=multi-user.target

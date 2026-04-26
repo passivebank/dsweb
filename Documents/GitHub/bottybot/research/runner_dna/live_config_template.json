@@ -1,0 +1,11 @@
+{
+  "champion":               "runner_dna_v1",
+  "halt":                   false,
+  "halt_reason":            null,
+  "max_position_pct":       0.10,
+  "bankroll_peak_usd":      130.17,
+  "bankroll_drawdown_halt": 0.10,
+  "promotion_log_path":     "/home/ec2-user/phase3_intrabar/artifacts/promotion_log.jsonl",
+  "last_promotion_ts":      null,
+  "notes":                  "Edit champion to swap filters. Set halt=true to pause all entries. bankroll_peak tracked by auto_promote. Drawdown >10% from peak triggers halt."
+}

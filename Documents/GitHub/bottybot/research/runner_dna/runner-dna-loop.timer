@@ -1,0 +1,12 @@
+[Unit]
+Description=Runner DNA — score + auto-promote every 4 hours
+Requires=runner-dna-loop.service
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=4h
+Unit=runner-dna-loop.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

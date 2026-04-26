@@ -18,19 +18,54 @@ from datetime import datetime, timezone as _tz
 from pathlib import Path
 from typing import Optional
 
-# Filter is implemented in the recorder package — same module the shadow
-# tagging uses, so live and shadow stay in lockstep. If the recorder package
-# is unavailable for any reason the executor fails closed (rejects all
-# entries) rather than falling back to the old precision filter.
+# Filter resolution is config-driven — `live_filter_config.json` names the
+# active champion, which the executor looks up in the challenger registry on
+# every signal. This lets the auto-promotion engine swap champions atomically
+# (write the JSON) without a service restart.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 try:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from recorder.runner_dna_filter import runner_dna_v1_passes
+    from recorder.runner_dna_filter import runner_dna_v1_passes  # noqa: F401  (back-compat)
+    from research.runner_dna.registry import get_filter, REGISTRY
+    _REGISTRY_IMPORT_ERROR = ""
 except Exception as _imp_err:
-    def runner_dna_v1_passes(features, variant) -> bool:
-        return False
-    _RUNNER_DNA_IMPORT_ERROR = str(_imp_err)
-else:
-    _RUNNER_DNA_IMPORT_ERROR = ""
+    def get_filter(name):
+        def _reject(features, variant):
+            return False
+        return _reject
+    REGISTRY = {}
+    _REGISTRY_IMPORT_ERROR = str(_imp_err)
+
+
+# Live filter config — loaded fresh on every entry decision (small file,
+# negligible cost). Lets auto-promotion swap champions by rewriting the JSON.
+_LIVE_CONFIG_PATH = Path(os.environ.get(
+    "LIVE_FILTER_CONFIG",
+    "/home/ec2-user/phase3_intrabar/live_filter_config.json",
+))
+_LIVE_CONFIG_FALLBACK = {
+    "champion": "runner_dna_v1",
+    "halt": False,
+    "max_position_pct": 0.10,
+    "bankroll_peak_usd": 0.0,
+    "bankroll_drawdown_halt": 0.10,
+}
+
+
+def _load_live_config() -> dict:
+    """Read the runtime config. On missing file or parse error, fall back to
+    safe defaults — never crash the entry pipeline because of a config issue."""
+    try:
+        if _LIVE_CONFIG_PATH.exists():
+            with _LIVE_CONFIG_PATH.open() as f:
+                return {**_LIVE_CONFIG_FALLBACK, **json.load(f)}
+    except Exception as e:
+        # Log but don't raise — degrade to default config
+        logging.getLogger("LiveExecutor").error(
+            f"[CONFIG] failed to read {_LIVE_CONFIG_PATH}: {e} — using defaults"
+        )
+    return dict(_LIVE_CONFIG_FALLBACK)
+
 
 log = logging.getLogger("LiveExecutor")
 log.setLevel(logging.INFO)
@@ -1012,48 +1047,74 @@ class LiveExecutor:
             log.info(f"[SKIP] {coin} variant={variant} not in approved exit-policy set")
             return
 
-        # ── runner_dna_v1 entry filter ──────────────────────────────
-        # Replaces the precision filter stack as of 2026-04-25. Two-path
-        # entry: continuation (Path A) or absorption (Path B). See
-        # research/runner_dna/REPORT.md for derivation. The previous tier
-        # A/B panic skip and `cvd_30s > -2000` gate were REMOVED — the DNA
-        # analysis showed both were excluding profitable signals.
-        if _RUNNER_DNA_IMPORT_ERROR:
-            log.error(f"[SKIP] {coin} runner_dna_v1 unavailable: {_RUNNER_DNA_IMPORT_ERROR}")
+        # ── Champion filter resolution + safety gates ───────────────
+        # Champion name comes from live_filter_config.json (atomic swap by
+        # the auto-promotion engine). Halt flag + bankroll drawdown halt
+        # are enforced here so a regression triggers an immediate stop.
+        if _REGISTRY_IMPORT_ERROR:
+            log.error(f"[SKIP] {coin} filter registry unavailable: {_REGISTRY_IMPORT_ERROR}")
             return
-        if not runner_dna_v1_passes(sig.features, variant):
-            # Why-not breakdown to help inspection of close misses
+        cfg = _load_live_config()
+        if cfg.get("halt"):
+            log.info(f"[SKIP] {coin} HALT flag set in config: {cfg.get('halt_reason','no reason')}")
+            return
+        # Bankroll-peak drawdown halt: if cash + position value drops 10%+
+        # from peak, stop new entries until human review.
+        peak = float(cfg.get("bankroll_peak_usd") or 0.0)
+        dd_pct = float(cfg.get("bankroll_drawdown_halt") or 0.10)
+        if peak > 0:
+            with self._balance_lock:
+                cur_bal = self._usd_cache
+            if cur_bal > 0 and cur_bal < peak * (1 - dd_pct):
+                log.warning(
+                    f"[SKIP] {coin} bankroll drawdown halt active: "
+                    f"cur=${cur_bal:.2f} peak=${peak:.2f} "
+                    f"drop={(1 - cur_bal/peak)*100:.1f}% > {dd_pct*100:.0f}%"
+                )
+                return
+
+        champion_name = cfg.get("champion", "runner_dna_v1")
+        try:
+            champion_filter = get_filter(champion_name)
+        except KeyError:
+            log.error(f"[SKIP] {coin} unknown champion '{champion_name}' — failing closed")
+            return
+
+        if not champion_filter(sig.features, variant):
+            # Why-not breakdown — best-effort, only meaningful for runner_dna_*
+            # filters which share the same gate vocabulary.
             f = sig.features
             why = []
-            if (f.get("btc_rel_ret_5m") or -1) < 0.02:
-                why.append(f"btc_rel={f.get('btc_rel_ret_5m')}")
-            if (f.get("signals_24h") or 0) > 15:
-                why.append(f"signals_24h={f.get('signals_24h')}>15")
-            hl = f.get("higher_lows_3m")
-            if hl is True:
-                if (f.get("step_2m") or 0) < 0.012:
-                    why.append(f"PathA step_2m={f.get('step_2m')}<0.012")
-                if (f.get("candle_close_str_1m") or 0) < 0.70:
-                    why.append(f"PathA ccs={f.get('candle_close_str_1m')}<0.70")
-                if (f.get("rank_60s") or 99) > 3:
-                    why.append(f"PathA rank={f.get('rank_60s')}>3")
-            elif hl is False:
-                if (f.get("cvd_30s") or 0) >= -3000:
-                    why.append(f"PathB cvd_30s={f.get('cvd_30s')}>=-3000")
-                if (f.get("ask_depth_usd") or 0) < 5000:
-                    why.append(f"PathB ask_d={f.get('ask_depth_usd')}<5000")
-                if (f.get("bid_depth_usd") or 0) < 5000:
-                    why.append(f"PathB bid_d={f.get('bid_depth_usd')}<5000")
-            else:
-                why.append(f"hl3m={hl}")
-            log.info(f"[SKIP] {coin} runner_dna_v1=False ({', '.join(why)})")
+            if champion_name.startswith("runner_dna") or champion_name == "combined_or":
+                if (f.get("btc_rel_ret_5m") or -1) < 0.02:
+                    why.append(f"btc_rel={f.get('btc_rel_ret_5m')}")
+                if (f.get("signals_24h") or 0) > 15:
+                    why.append(f"signals_24h={f.get('signals_24h')}>15")
+                hl = f.get("higher_lows_3m")
+                if hl is True:
+                    if (f.get("step_2m") or 0) < 0.012:
+                        why.append(f"PathA step_2m={f.get('step_2m')}<0.012")
+                    if (f.get("candle_close_str_1m") or 0) < 0.70:
+                        why.append(f"PathA ccs={f.get('candle_close_str_1m')}<0.70")
+                    if (f.get("rank_60s") or 99) > 3:
+                        why.append(f"PathA rank={f.get('rank_60s')}>3")
+                elif hl is False:
+                    if (f.get("cvd_30s") or 0) >= -3000:
+                        why.append(f"PathB cvd_30s={f.get('cvd_30s')}>=-3000")
+                    if (f.get("ask_depth_usd") or 0) < 5000:
+                        why.append(f"PathB ask_d={f.get('ask_depth_usd')}<5000")
+                    if (f.get("bid_depth_usd") or 0) < 5000:
+                        why.append(f"PathB bid_d={f.get('bid_depth_usd')}<5000")
+                else:
+                    why.append(f"hl3m={hl}")
+            log.info(f"[SKIP] {coin} {champion_name}=False ({', '.join(why) or 'no specific reason'})")
             return
 
         # ── ACCEPTED — write audit record so every entry decision is inspectable
         f = sig.features
         which_path = "A_continuation" if f.get("higher_lows_3m") is True else "B_absorption"
         log.info(
-            f"[ACCEPT] {coin} variant={variant} path={which_path} "
+            f"[ACCEPT] {coin} champion={champion_name} variant={variant} path={which_path} "
             f"btc_rel={f.get('btc_rel_ret_5m')} cvd_30s={f.get('cvd_30s')} "
             f"hl3m={f.get('higher_lows_3m')} rank={f.get('rank_60s')} "
             f"step_2m={f.get('step_2m')} ccs={f.get('candle_close_str_1m')} "
@@ -1063,12 +1124,13 @@ class LiveExecutor:
             audit_path = self._trade_log.parent / "live_entry_audit.jsonl"
             with audit_path.open("a") as af:
                 af.write(json.dumps({
-                    "ts":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "ts_ns":   getattr(sig, "sig_ts_ns", None),
-                    "coin":    coin,
-                    "variant": variant,
-                    "path":    which_path,
-                    "sig_mid": getattr(sig, "sig_mid", None),
+                    "ts":       time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "ts_ns":    getattr(sig, "sig_ts_ns", None),
+                    "coin":     coin,
+                    "variant":  variant,
+                    "path":     which_path,
+                    "champion": champion_name,
+                    "sig_mid":  getattr(sig, "sig_mid", None),
                     "features": f,
                 }) + "\n")
         except Exception as e:

@@ -242,6 +242,19 @@ tr:hover td { background: #0f1828; }
     </div>
   </div>
 
+  <!-- ── Live champion + challenger scores ── -->
+  <div class="row">
+    <div class="card flex-2">
+      <div class="card-title">Live Champion (auto-promotion)</div>
+      <div id="champion-status" style="font-size:13px;line-height:1.6">—</div>
+      <div id="challenger-table" style="margin-top:10px;font-size:11px"></div>
+    </div>
+    <div class="card flex-1">
+      <div class="card-title">Recent Promotions</div>
+      <div id="promotion-list" style="font-size:11px;line-height:1.5">—</div>
+    </div>
+  </div>
+
   <!-- ── Exit slippage: smart-exit (limit-then-market) vs legacy market ── -->
   <div class="row">
     <div class="card flex-1">
@@ -774,6 +787,76 @@ async function fetchLog() {
   } catch (e) { console.error('log', e); }
 }
 
+async function fetchChampion() {
+  try {
+    const d = await (await fetch('/api/champion')).json();
+    renderChampion(d);
+  } catch (e) { console.error('champion', e); }
+}
+
+function renderChampion(d) {
+  const cfg = d.config || {};
+  const scores = (d.scores && d.scores.scores) || {};
+  const promotions = d.promotions || [];
+  const champion = cfg.champion || '—';
+  const halt = cfg.halt;
+  const peak = cfg.bankroll_peak_usd;
+  const ddHalt = (cfg.bankroll_drawdown_halt || 0.10) * 100;
+  const champClass = halt ? 'neg' : 'pos';
+  const haltLabel = halt ? `<span class="neg">⏸ HALTED — ${cfg.halt_reason || 'reason unknown'}</span>` : `<span class="pos">▶ active</span>`;
+  $('champion-status').innerHTML = `
+    <div><b>Champion:</b> <span class="${champClass}" style="font-weight:700">${champion}</span> · ${haltLabel}</div>
+    <div style="color:var(--muted);margin-top:4px">
+      Peak bankroll: $${peak ? Number(peak).toFixed(2) : '—'} ·
+      DD halt: ${ddHalt.toFixed(0)}% ·
+      Last promotion: ${cfg.last_promotion_ts || 'never'}
+    </div>
+  `;
+  // Challenger table — sorted by uplift over current champion's mean_net
+  const champScore = scores[champion] || {};
+  const champMean = champScore.mean_net_pct || 0;
+  const rows = Object.entries(scores)
+    .map(([name, s]) => ({ name, ...s, uplift: (s.mean_net_pct || 0) - champMean }))
+    .sort((a, b) => b.uplift - a.uplift);
+  if (!rows.length) {
+    $('challenger-table').innerHTML = '<div style="color:var(--muted)">No scores yet — auto-promotion runs every 4h on EC2.</div>';
+  } else {
+    let html = `<table style="width:100%;border-collapse:collapse">
+      <tr style="color:var(--muted)"><th align="left">filter</th><th align="right">n</th><th align="right">WR</th><th align="right">mean</th><th align="right">CI lo</th><th align="right">total</th><th align="right">DD</th><th align="right">vs champ</th></tr>`;
+    for (const r of rows) {
+      const isChamp = r.name === champion;
+      const upliftCls = r.uplift > 0 ? 'pos' : (r.uplift < 0 ? 'neg' : '');
+      const ciLo = (r.mean_net_ci_lo != null) ? (r.mean_net_ci_lo * 100).toFixed(2) + '%' : '—';
+      html += `<tr style="border-top:1px solid var(--border)">
+        <td>${isChamp ? '★ ' : '  '}<b>${r.name}</b></td>
+        <td align="right">${r.n_trades || 0}</td>
+        <td align="right">${r.win_rate != null ? (r.win_rate * 100).toFixed(0) + '%' : '—'}</td>
+        <td align="right">${r.mean_net_pct != null ? (r.mean_net_pct * 100).toFixed(2) + '%' : '—'}</td>
+        <td align="right">${ciLo}</td>
+        <td align="right">${r.total_return_pct != null ? r.total_return_pct.toFixed(1) + '%' : '—'}</td>
+        <td align="right">${r.max_drawdown_pct != null ? r.max_drawdown_pct.toFixed(1) + '%' : '—'}</td>
+        <td align="right" class="${upliftCls}">${isChamp ? '—' : (r.uplift * 100).toFixed(2) + '%'}</td>
+      </tr>`;
+    }
+    html += '</table>';
+    $('challenger-table').innerHTML = html;
+  }
+  // Promotion history
+  if (!promotions.length) {
+    $('promotion-list').innerHTML = '<div style="color:var(--muted)">No promotions yet.</div>';
+  } else {
+    $('promotion-list').innerHTML = promotions.slice().reverse().map(p => {
+      if (p.action === 'promote' || p.action === 'would_promote') {
+        const upl = p.uplift_pct != null ? (p.uplift_pct * 100).toFixed(2) + '%' : '?';
+        return `<div>${p.ts_utc || ''}<br><b class="pos">${p.old_champion} → ${p.new_champion}</b> · uplift ${upl}</div>`;
+      } else if (p.action === 'peak_updated') {
+        return `<div style="color:var(--muted)">${p.ts_utc || ''}: peak $${p.old_peak} → $${p.new_peak}</div>`;
+      }
+      return `<div style="color:var(--muted)">${p.ts_utc || ''}: ${p.action || JSON.stringify(p)}</div>`;
+    }).join('');
+  }
+}
+
 async function fetchHeartbeat() {
   try {
     const d = await (await fetch('/api/heartbeat')).json();
@@ -797,7 +880,7 @@ function toast(msg) {
 
 async function refreshAll() {
   $('last-refresh').textContent = 'refreshing…';
-  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat()]);
+  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat(), fetchChampion()]);
   $('last-refresh').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
@@ -826,6 +909,7 @@ setInterval(fetchTrades,    30000);
 setInterval(fetchPortfolio, 60000);
 setInterval(fetchLog,       10000);
 setInterval(fetchHeartbeat, 15000);
+setInterval(fetchChampion,  60000);
 </script>
 </body>
 </html>

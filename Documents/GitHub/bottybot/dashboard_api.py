@@ -17,9 +17,12 @@ app = FastAPI(title="BOTTY Command Center — Phase 3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # File paths (same whether local or on EC2)
-LIVE_TRADES  = "/home/ec2-user/phase3_intrabar/artifacts/live_trades.jsonl"
-RECORDER_LOG = "/home/ec2-user/phase3_intrabar/artifacts/recorder.log"
-HEARTBEAT    = "/home/ec2-user/phase3_intrabar/artifacts/recorder_heartbeat.json"
+LIVE_TRADES         = "/home/ec2-user/phase3_intrabar/artifacts/live_trades.jsonl"
+RECORDER_LOG        = "/home/ec2-user/phase3_intrabar/artifacts/recorder.log"
+HEARTBEAT           = "/home/ec2-user/phase3_intrabar/artifacts/recorder_heartbeat.json"
+LIVE_FILTER_CONFIG  = "/home/ec2-user/phase3_intrabar/live_filter_config.json"
+CHALLENGER_SCORES   = "/home/ec2-user/phase3_intrabar/artifacts/challenger_scores.json"
+PROMOTION_LOG       = "/home/ec2-user/phase3_intrabar/artifacts/promotion_log.jsonl"
 
 # Auto-detect: if running ON the EC2, files are local; otherwise SSH
 LOCAL = Path(LIVE_TRADES).exists()
@@ -460,6 +463,52 @@ def api_log():
         "events":      events,
         "stats_line":  stats_line,
     }
+
+
+def _scrub_nan(o):
+    """Recursively replace NaN/Inf with None — FastAPI's JSON encoder
+    rejects them, but Python's json reads them. The scoring engine emits
+    NaN in daily_sharpe for single-day windows."""
+    import math
+    if isinstance(o, dict):
+        return {k: _scrub_nan(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_scrub_nan(v) for v in o]
+    if isinstance(o, float) and (math.isnan(o) or math.isinf(o)):
+        return None
+    return o
+
+
+@app.get("/api/champion")
+def api_champion():
+    """Current live champion + most recent challenger scores + last 10 promotions."""
+    cfg = {}
+    raw_cfg = read_file(LIVE_FILTER_CONFIG, "live_filter_cfg", ttl=15)
+    try:
+        cfg = json.loads(raw_cfg)
+    except Exception:
+        pass
+
+    scores = {}
+    raw_scores = read_file(CHALLENGER_SCORES, "challenger_scores", ttl=60)
+    try:
+        scores = json.loads(raw_scores)
+    except Exception:
+        pass
+
+    promotions = []
+    raw_promo = run_remote(f"tail -n 20 {PROMOTION_LOG} 2>/dev/null", "promotion_log", ttl=60)
+    for line in raw_promo.strip().splitlines():
+        try:
+            promotions.append(json.loads(line))
+        except Exception:
+            pass
+
+    return _scrub_nan({
+        "config":     cfg,
+        "scores":     scores,
+        "promotions": promotions[-10:],
+    })
 
 
 @app.get("/api/heartbeat")
