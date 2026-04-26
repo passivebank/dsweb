@@ -49,6 +49,7 @@ _LIVE_CONFIG_FALLBACK = {
     "max_position_pct": 0.10,
     "bankroll_peak_usd": 0.0,
     "bankroll_drawdown_halt": 0.10,
+    "hard_stop_pct": 0.025,
 }
 
 
@@ -723,17 +724,19 @@ class LiveExecutor:
                     del self._positions[coin]
                 return
 
-            # R7/R8: fixed 5-min hold, 2.5% hard stop from entry
-            # Widened from 1%→2.5%: 21k hard_stops at -1.06% each was the single
-            # largest P&L drag. Normal altcoin volatility was triggering the 1% stop
-            # on moves that would have recovered within the 5-minute window.
+            # R7/R8: fixed 5-min hold, hard stop from entry. Stop pct stored
+            # on the position at entry time (read from live_filter_config.json,
+            # default 0.025). Lets the auto-promotion engine pair a champion
+            # with a calibrated stop without an executor restart.
             if pos.get("exit_policy") == "time_300s":
                 if hold_s >= 300:
                     self._q.put(("sell", coin, pos.copy(), price, "TIME_CAP"))
                     del self._positions[coin]
-                elif price <= pos["entry_px"] * 0.975:
-                    self._q.put(("sell", coin, pos.copy(), price, "TRAIL_STOP"))
-                    del self._positions[coin]
+                else:
+                    stop_frac = pos.get("hard_stop_pct", 0.025)
+                    if price <= pos["entry_px"] * (1.0 - stop_frac):
+                        self._q.put(("sell", coin, pos.copy(), price, "TRAIL_STOP"))
+                        del self._positions[coin]
                 return
 
             # R10 positions: 120m hold, 18% trail from peak, 10% hard stop — no partial
@@ -1241,6 +1244,11 @@ class LiveExecutor:
         # If _is_r11 here, R12 gates (higher_lows_3m + cvd_30s>0) already passed in _handle_entry
         effective_variant = "R12_PRECISION" if _is_r11 else _sig_variant
 
+        # Read hard_stop_pct from live config — config-driven so the
+        # auto-promotion engine can change it without a restart.
+        cfg = _load_live_config()
+        hard_stop_pct = float(cfg.get("hard_stop_pct", 0.025))
+
         with self._lock:
             self._positions[coin] = {
                 "entry_px":  actual_px,
@@ -1252,6 +1260,7 @@ class LiveExecutor:
                 "usd_in":    filled_value,
                 "buy_order": order_id,
                 "pos_pct":   pos_pct,
+                "hard_stop_pct": hard_stop_pct,
                 "exit_policy": (
                     "r11_trail"  if _is_r11
                     else "time_300s" if _sig_variant in ("R7_STAIRCASE", "R8_HIGH_CONVICTION")
