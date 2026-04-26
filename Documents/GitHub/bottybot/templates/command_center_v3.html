@@ -242,6 +242,18 @@ tr:hover td { background: #0f1828; }
     </div>
   </div>
 
+  <!-- ── Exit slippage: smart-exit (limit-then-market) vs legacy market ── -->
+  <div class="row">
+    <div class="card flex-1">
+      <div class="card-title">Exit Slippage (bps from trigger→fill)</div>
+      <div id="slip-stats" style="font-size:12px;line-height:1.8">—</div>
+      <div style="margin-top:6px;font-size:10px;color:var(--muted)">
+        Positive bps = price moved against us between stop/cap trigger and actual fill.
+        Smart-exit (limit-then-market) replaced market-sell for TIME_CAP exits on 2026-04-25.
+      </div>
+    </div>
+  </div>
+
   <!-- ── Open positions (shown only when active) ── -->
   <div class="card" id="open-card" style="margin-bottom:12px;display:none">
     <div class="card-title">&#9679; Open Positions</div>
@@ -534,6 +546,43 @@ function renderStats(s) {
   if (s.r5 && s.r5.n > 0) rows.push(vPerfRow('R5', 'vbr5', s.r5));
   if (s.r10 && s.r10.n > 0) rows.push(vPerfRow('R10', 'vbr10', s.r10));
   $('variant-perf').innerHTML = rows.join('');
+
+  // Exit slippage panel
+  renderSlip(s.slippage);
+}
+
+function slipRow(label, s) {
+  if (!s || s.n === 0) {
+    return `<div style="display:flex;justify-content:space-between;color:var(--muted)">
+      <span>${label}</span><span>no data yet</span></div>`;
+  }
+  const meanCls = s.mean_bps > 20 ? 'neg' : (s.mean_bps < 5 ? 'pos' : '');
+  return `<div style="display:flex;justify-content:space-between">
+    <span>${label}</span>
+    <span>
+      n=${s.n}
+      <span style="color:var(--muted);margin-left:8px">mean</span>
+      <span class="${meanCls}" style="font-weight:600">${fmtSign(s.mean_bps)}bps</span>
+      <span style="color:var(--muted);margin-left:8px">p90</span>
+      <span style="font-weight:600">${fmtSign(s.p90_bps)}bps</span>
+    </span>
+  </div>`;
+}
+
+function fmtSign(n) {
+  if (n == null) return '—';
+  return (n > 0 ? '+' : '') + n.toFixed(1);
+}
+
+function renderSlip(sl) {
+  if (!sl) { $('slip-stats').textContent = '—'; return; }
+  const parts = [
+    slipRow('TIME_CAP · smart exit (new)',    sl.smart),
+    slipRow('TIME_CAP + TRAIL_STOP · market (legacy)', sl.market),
+    slipRow('all TIME_CAP exits',             sl.time_cap),
+    slipRow('all TRAIL_STOP exits',           sl.trail_stop),
+  ];
+  $('slip-stats').innerHTML = parts.join('');
 }
 
 function vPerfRow(label, cls, v) {

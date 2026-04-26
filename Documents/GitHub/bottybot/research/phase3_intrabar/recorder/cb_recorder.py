@@ -51,10 +51,15 @@ from recorder.storage import RollingWriter
 from recorder.orderbook import BookTracker
 from recorder.l2_watchlist import WatchlistManager
 from shadow.simulator import ShadowSimulator
+from live_executor import LiveExecutor
+from runner_scorer import RunnerScorer
+from recorder.runner_dna_filter import runner_dna_v1_passes
 
 PHASE3_ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = PHASE3_ROOT / "artifacts"
 ARTIFACTS.mkdir(exist_ok=True)
+
+NS = 1_000_000_000  # nanoseconds per second
 
 # Storage paths — overridable for the EC2 deploy
 ACTIVE_DIR = Path(os.environ.get("PHASE3_ACTIVE_DIR", "/tmp/phase3_active"))
@@ -226,7 +231,7 @@ class BinanceWSPoller:
         while not self._stop:
             try:
                 async with websockets.connect(
-                    working_url, ping_interval=20, ping_timeout=30, max_size=2 ** 23,
+                    working_url, ping_interval=20, ping_timeout=90, max_size=2 ** 23,
                 ) as ws:
                     self._connected = True
                     print(f"[binance-ws] streaming: {working_url}", flush=True)
@@ -492,6 +497,8 @@ class Recorder:
         self.products = products
         self.engine = DetectorEngine(on_signal=self._on_signal)
         self.shadow = ShadowSimulator(log_path=shadow_log, engine=self.engine)
+        self.executor = LiveExecutor(trade_log_path=ARTIFACTS / "live_trades.jsonl")
+        self.scorer    = RunnerScorer()
         self.writer = RollingWriter(
             active_dir=active_dir,
             durable_dir=durable_dir,
@@ -599,6 +606,43 @@ class Recorder:
         if bid_d > 0:
             sig.features["bid_depth_usd"] = round(bid_d, 2)
 
+        # Runner classifier scoring (R5 only) — additive, never gates
+        if sig.variant == "R5_CONFIRMED_RUN":
+            try:
+                btc_r1h  = sig.features.get("btc_ret_1h", 0.0) or 0.0
+                hour_utc = sig.features.get("utc_hour",
+                               datetime.now(timezone.utc).hour)
+                cr = self.scorer.score(
+                    coin       = coin,
+                    ig_dvt     = sig.features.get("dv_trend", 0.0),
+                    ig_r5m     = sig.features.get("ret_5m", 0.0),
+                    ig_r15m    = sig.features.get("ret_15m", 0.08),
+                    ig_r_low30 = sig.features.get("ret_15m", 0.08),
+                    btc_r1h    = btc_r1h,
+                    hour_utc   = int(hour_utc),
+                )
+                sig.features["cls_p_fakeout"] = cr["p_fakeout"]
+                sig.features["cls_p_go"]      = cr["p_go"]
+                sig.features["cls_p_weak"]    = cr["p_weak"]
+                sig.features["cls_verdict"]   = cr["verdict"]
+                sig.features["cls_pos_scale"] = cr["pos_scale"]
+                sig.features["cls_scored"]    = cr["scored"]
+            except Exception:
+                pass
+
+        # ── runner_dna_v1 candidate-filter shadow tag ───────────────
+        # Tag every signal with whether the candidate filter would accept it,
+        # so we can compare its forward performance to champion_v1 over
+        # accumulating out-of-sample data without changing live execution.
+        # Wrapped in try/except so a filter bug never breaks the signal
+        # pipeline.
+        try:
+            sig.features["runner_dna_v1"] = bool(
+                runner_dna_v1_passes(sig.features, sig.variant)
+            )
+        except Exception:
+            sig.features["runner_dna_v1"] = False
+
         # ── Persist the signal ──────────────────────────────────────
         with self.signal_log.open("a") as f:
             f.write(json.dumps({
@@ -609,8 +653,56 @@ class Recorder:
                 "features":  sig.features,
             }) + "\n")
 
+        # Sidecar: signals that passed the candidate filter — small,
+        # human-inspectable, makes "did it fire today?" trivial to check.
+        if sig.features.get("runner_dna_v1"):
+            try:
+                with (ARTIFACTS / "runner_dna_signals.jsonl").open("a") as f:
+                    f.write(json.dumps({
+                        "ts_ns":   sig.sig_ts_ns,
+                        "coin":    sig.coin,
+                        "variant": sig.variant,
+                        "sig_mid": sig.sig_mid,
+                        "btc_rel_ret_5m":  sig.features.get("btc_rel_ret_5m"),
+                        "cvd_30s":         sig.features.get("cvd_30s"),
+                        "higher_lows_3m":  sig.features.get("higher_lows_3m"),
+                        "rank_60s":        sig.features.get("rank_60s"),
+                        "step_2m":         sig.features.get("step_2m"),
+                        "candle_close_str_1m": sig.features.get("candle_close_str_1m"),
+                        "ask_depth_usd":   sig.features.get("ask_depth_usd"),
+                        "bid_depth_usd":   sig.features.get("bid_depth_usd"),
+                        "signals_24h":     sig.features.get("signals_24h"),
+                        "ret_24h":         sig.features.get("ret_24h"),
+                    }) + "\n")
+            except Exception:
+                pass
+
         # ── Hand off to shadow simulator ────────────────────────────
         self.shadow.on_signal(sig)
+        # ── Live execution ───────────────────────────────────────────
+        self.executor.on_signal(sig)
+
+    async def _bar_snapshot_loop(self) -> None:
+        """Every 60s snapshot per-coin CoinState into RunnerScorer bar buffer."""
+        import time as _time
+        await asyncio.sleep(120)  # let engine warm up first
+        while not self._stop:
+            try:
+                now_ns = _time.time_ns()
+                now_s  = now_ns / 1e9
+                for coin, st in list(self.engine.coins.items()):
+                    if st.last_mid <= 0:
+                        continue
+                    try:
+                        dvt  = st.dv_trend(now_ns, 60)
+                        r5m  = st.return_over(now_ns, 300)
+                        r15m = st.return_over(now_ns, 900)
+                        self.scorer.tick(coin, now_s, st.last_mid, dvt, r5m, r15m)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            await asyncio.sleep(60)
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop:
@@ -651,7 +743,7 @@ class Recorder:
                 async with websockets.connect(
                     WS_URL,
                     ping_interval=15,
-                    ping_timeout=20,
+                    ping_timeout=90,
                     max_size=2**22,
                     user_agent_header=USER_AGENT,
                 ) as ws:
@@ -755,6 +847,7 @@ class Recorder:
                                   "side": side, "recv_ts_ns": recv_ns})
             self.shadow.on_event({"ch": "trade", "coin": prod, "price": price_f,
                                   "recv_ts_ns": recv_ns})
+            self.executor.on_price(prod, price_f)
             self.stats["trades_total"] += 1
         elif t == "ticker":
             prod = msg.get("product_id") or ""
@@ -848,6 +941,7 @@ class Recorder:
                 self._subscription_manager_loop(),
                 self._mkt.run(),
                 self._binance.run(),
+                self._bar_snapshot_loop(),
                 self._bn_futures.run(),
             )
         finally:

@@ -154,6 +154,21 @@ def parse_live_trades():
                     variant = "R11_BIG_STAIRCASE"
             entry_px = _get_field(entry or {}, "price", "entry_px", default=0)
 
+            # Slippage on the exit leg: (trigger_px - exit_px) / trigger_px * 10000.
+            # Positive = price moved against us between stop trigger and fill.
+            # Only measurable when trigger_px is recorded (not all legacy rows).
+            exit_px_val = _get_field(e, "price", "exit_px", default=0)
+            trigger_px  = e.get("trigger_px")
+            slip_bps    = None
+            if trigger_px and exit_px_val and trigger_px > 0:
+                slip_bps = round((trigger_px - exit_px_val) / trigger_px * 10000, 1)
+
+            # exit_path ("smart" | "market") marks which code path handled the
+            # exit. Present on EXIT events written after the smart-exit deploy.
+            exit_path = e.get("exit_path") or (
+                "market" if exit_ts < "2026-04-25" else None
+            )
+
             closed.append({
                 "coin":        coin,
                 "variant":     variant,
@@ -161,16 +176,20 @@ def parse_live_trades():
                 "entry_ts":    entry_ts,
                 "exit_ts":     exit_ts,
                 "entry_px":    entry_px,
-                "exit_px":     _get_field(e, "price", "exit_px", default=0),
+                "exit_px":     exit_px_val,
+                "trigger_px":  trigger_px,
                 "usd_in":      usd_in,
                 "gain":        round(gain, 4),
                 "pnl_usd":     pnl_usd,
                 "hold_min":    e.get("hold_min", 0),
                 "exit_reason": _get_field(e, "reason", "exit_reason", default=""),
+                "exit_path":   exit_path,
+                "slip_bps":    slip_bps,
                 "win":         gain > 0,
                 "rank_60s":    features.get("rank_60s", ""),
                 "breadth":     features.get("market_breadth_5m", ""),
                 "half_sold":   e.get("half_sold", False),
+                "intended_px": _get_field(entry or {}, "intended_px", default=None),
             })
 
         # FILL/PARTIAL events: ignored for P&L tracking
@@ -290,7 +309,8 @@ def get_portfolio() -> dict:
 
 def parse_log():
     raw = grep_file(RECORDER_LOG,
-        r'\[SKIP\]|\[SIG-QUEUED\]|\[ENTRY\]|\[EXIT\]|\[stats\]',
+        r'\[SKIP\]|\[SIG-QUEUED\]|\[ENTRY\]|\[EXIT\]|\[stats\]|'
+        r'\[LIMIT-SELL\]|\[SMART-EXIT\]|\[RECONCILE\].*stranded',
         "filter_log", ttl=12, tail=600,
     )
 
@@ -320,6 +340,14 @@ def parse_log():
         elif "[EXIT]" in line:
             text = line.split("[EXIT]", 1)[-1].strip()
             recent_events.append({"type": "EXIT", "text": text[:80]})
+
+        elif "[LIMIT-SELL]" in line:
+            text = line.split("[LIMIT-SELL]", 1)[-1].strip()
+            recent_events.append({"type": "LIMIT", "text": text[:80]})
+
+        elif "[SMART-EXIT" in line:
+            text = line.split("[SMART-EXIT", 1)[-1].strip()
+            recent_events.append({"type": "SMART", "text": text[:80]})
 
         elif "[stats]" in line:
             stats_line = line.split("[stats]", 1)[-1].strip()
@@ -358,6 +386,31 @@ def api_trades():
             "avg":  round(sum(t["gain"] for t in subset) / max(len(subset), 1) * 100, 2),
         }
 
+    def slip_summary(subset):
+        """Aggregate exit-slippage stats for a trade subset."""
+        vals = [t["slip_bps"] for t in subset if t["slip_bps"] is not None]
+        if not vals:
+            return {"n": 0, "mean_bps": None, "median_bps": None, "p90_bps": None}
+        vals_sorted = sorted(vals)
+        mean = sum(vals) / len(vals)
+        n    = len(vals)
+        med  = vals_sorted[n // 2] if n % 2 else (vals_sorted[n//2 - 1] + vals_sorted[n//2]) / 2
+        p90  = vals_sorted[min(n - 1, int(0.9 * (n - 1)))]
+        return {
+            "n":          n,
+            "mean_bps":   round(mean, 1),
+            "median_bps": round(med, 1),
+            "p90_bps":    round(p90, 1),
+        }
+
+    # Compare smart-exit (new) vs market-exit (old/trail-stop) on TIME_CAP
+    # outcomes. The dashboard surfaces this so the impact of the smart-exit
+    # deploy is visible over time.
+    smart_exits  = [t for t in completed if t["exit_path"] == "smart"]
+    market_exits = [t for t in completed if t["exit_path"] == "market"]
+    time_cap     = [t for t in completed if t["exit_reason"] == "TIME_CAP"]
+    trail_stop   = [t for t in completed if t["exit_reason"] == "TRAIL_STOP"]
+
     return {
         "closed":  list(reversed(completed))[:60],   # most-recent first for table
         "open":    open_pos,
@@ -384,6 +437,12 @@ def api_trades():
             "r7":              variant_stats(r7),
             "r5":              variant_stats(r5),
             "r10":             variant_stats(r10),
+            "slippage": {
+                "smart":      slip_summary(smart_exits),
+                "market":     slip_summary(market_exits),
+                "time_cap":   slip_summary(time_cap),
+                "trail_stop": slip_summary(trail_stop),
+            },
         },
     }
 
