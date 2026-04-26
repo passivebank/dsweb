@@ -184,6 +184,45 @@ def combined_or(features: dict, variant: str) -> bool:
     return runner_dna_v1(features, variant) or champion_v1_legacy(features, variant)
 
 
+# ── runner_dna_v2_sharpened ────────────────────────────────────────────────
+# Derived from research/runner_dna/optimize_stop.py per-feature analysis on
+# 14 days of shadow data (n=26 surviving trades, 77% WR, mean +1.65%/trade,
+# CI lo +0.37% at 3.5% stop). The first filter we've found with a positive
+# lower bound on its 95% bootstrap CI of mean net.
+#
+# WHY these gates were chosen — ALL three came from the per-feature
+# stratification, not from prior intuition:
+#   spread ≥ 14bps  : q3+q4 of spread were the only positive-EV buckets;
+#                     q1+q2 (tight spreads) were structurally losing
+#   ask_depth ≤ 9k  : q4 of depth (>$9k) was strongly negative; thinner
+#                     books were where the runners actually paid
+#   step_2m ≥ 0.015 : low step_2m (q1+q2) had WR<45% and lost money
+#
+# The intuition matches: we are paying spread on entry, so signals where
+# the spread is wide AND the book is thin are paying us back the
+# expectation that other liquidity providers can't compete on. Tight
+# books = retail FOMO that fades; thin books = real demand revealing
+# itself.
+#
+# Pair this filter with a 3.5% (not 2.5%) hard stop. The 2.5% on this
+# filter was -0.11% CI lo; 3.5% was +0.37%.
+def runner_dna_v2_sharpened(features: dict, variant: str) -> bool:
+    if not runner_dna_v1(features, variant):
+        return False
+    spread = _g(features, "spread_bps_at_entry")
+    if spread is None:
+        spread = _g(features, "spread_bps")
+    if spread is None or float(spread) < 14.0:
+        return False
+    ask_d = _g(features, "ask_depth_usd", 0.0) or 0.0
+    if float(ask_d) > 9000.0:
+        return False
+    step = _g(features, "step_2m", 0.0) or 0.0
+    if float(step) < 0.015:
+        return False
+    return True
+
+
 # ── REGISTRY ────────────────────────────────────────────────────────────────
 # name → (callable, description)
 REGISTRY: dict[str, tuple[Callable, str]] = {
@@ -194,6 +233,8 @@ REGISTRY: dict[str, tuple[Callable, str]] = {
     "runner_dna_abs":     (runner_dna_abs_only,  "Path B absorption only"),
     "combined_or":        (combined_or,        "runner_dna_v1 OR legacy champion"),
     "champion_v1_legacy": (champion_v1_legacy, "old precision filter — baseline"),
+    "runner_dna_v2_sharpened": (runner_dna_v2_sharpened,
+        "v1 + spread≥14bps + ask_d≤9k + step_2m≥0.015 — first filter with positive CI lo"),
 }
 
 
