@@ -18,6 +18,20 @@ from datetime import datetime, timezone as _tz
 from pathlib import Path
 from typing import Optional
 
+# Filter is implemented in the recorder package — same module the shadow
+# tagging uses, so live and shadow stay in lockstep. If the recorder package
+# is unavailable for any reason the executor fails closed (rejects all
+# entries) rather than falling back to the old precision filter.
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from recorder.runner_dna_filter import runner_dna_v1_passes
+except Exception as _imp_err:
+    def runner_dna_v1_passes(features, variant) -> bool:
+        return False
+    _RUNNER_DNA_IMPORT_ERROR = str(_imp_err)
+else:
+    _RUNNER_DNA_IMPORT_ERROR = ""
+
 log = logging.getLogger("LiveExecutor")
 log.setLevel(logging.INFO)
 if not log.handlers:
@@ -981,92 +995,84 @@ class LiveExecutor:
             )
             return
 
-        # Tier A/B are consolidation patterns (r5m 0.5-1%).
-        # Skip only in true panic: F&G < 15 AND BTC not recovering intraday.
-        # Threshold lowered from 25→15: F&G=21 is "nervous", not panic.
-        # F&G updates once/day at midnight UTC — it cannot capture intraday
-        # sentiment reversals (macro catalysts, BTC recovery legs, etc.).
-        # Override: if BTC is up >2% in the last hour, market has turned
-        # risk-on regardless of the stale daily index.
-        btc_ret_1h = sig.features.get("btc_ret_1h", 0.0)
-        if tier in ("A", "B") and fear_greed < 15 and btc_ret_1h <= 0.02:
-            log.info(
-                f"[SKIP] {coin} Tier={tier} F&G={fear_greed} btc_1h={btc_ret_1h:+.1%}"
-                f" — true panic, consolidation skip"
-            )
-            return
-
-        cvd_30s = sig.features.get("cvd_30s", 0.0)
-        if cvd_30s < GATE_CVD_30S_MIN:
-            log.info(f"[SKIP] {coin} cvd_30s={cvd_30s:.0f} < {GATE_CVD_30S_MIN} — net selling pressure")
-            return
-
+        # ── Onset freshness gate (kept) ─────────────────────────────
+        # Edge collapses past ~8s; the precision filter never relied on this
+        # for runner DNA either. Cheap to keep.
         secs_onset = sig.features.get("secs_since_onset", 0.0)
         if secs_onset >= GATE_ONSET_S:
             log.info(f"[SKIP] {coin} secs_since_onset={secs_onset:.1f}s >= {GATE_ONSET_S}s — late entry")
             return
 
-        # -- Precision filter stack --
+        # ── Variant whitelist (kept) ────────────────────────────────
+        # Exit policies (time_300s, r10_120m, r11_trail) are configured only
+        # for these variants. Other variants would fall to the default 4h cap
+        # which is not appropriate for runner_dna_v1's expected hold time.
         variant = getattr(sig, "variant", "")
         if variant not in ("R7_STAIRCASE", "R8_HIGH_CONVICTION", "R10_EXPLOSION_ONSET"):
-            log.info(f"[SKIP] {coin} variant={variant} not approved")
+            log.info(f"[SKIP] {coin} variant={variant} not in approved exit-policy set")
             return
 
-        _s2m = (sig.features.get("step_2m", 0) or 0)
-        _spd = (sig.features.get("spread_bps", 999) or 999)
-        _r11 = (variant == "R7_STAIRCASE" and _s2m >= 0.018 and _spd <= 8)
+        # ── runner_dna_v1 entry filter ──────────────────────────────
+        # Replaces the precision filter stack as of 2026-04-25. Two-path
+        # entry: continuation (Path A) or absorption (Path B). See
+        # research/runner_dna/REPORT.md for derivation. The previous tier
+        # A/B panic skip and `cvd_30s > -2000` gate were REMOVED — the DNA
+        # analysis showed both were excluding profitable signals.
+        if _RUNNER_DNA_IMPORT_ERROR:
+            log.error(f"[SKIP] {coin} runner_dna_v1 unavailable: {_RUNNER_DNA_IMPORT_ERROR}")
+            return
+        if not runner_dna_v1_passes(sig.features, variant):
+            # Why-not breakdown to help inspection of close misses
+            f = sig.features
+            why = []
+            if (f.get("btc_rel_ret_5m") or -1) < 0.02:
+                why.append(f"btc_rel={f.get('btc_rel_ret_5m')}")
+            if (f.get("signals_24h") or 0) > 15:
+                why.append(f"signals_24h={f.get('signals_24h')}>15")
+            hl = f.get("higher_lows_3m")
+            if hl is True:
+                if (f.get("step_2m") or 0) < 0.012:
+                    why.append(f"PathA step_2m={f.get('step_2m')}<0.012")
+                if (f.get("candle_close_str_1m") or 0) < 0.70:
+                    why.append(f"PathA ccs={f.get('candle_close_str_1m')}<0.70")
+                if (f.get("rank_60s") or 99) > 3:
+                    why.append(f"PathA rank={f.get('rank_60s')}>3")
+            elif hl is False:
+                if (f.get("cvd_30s") or 0) >= -3000:
+                    why.append(f"PathB cvd_30s={f.get('cvd_30s')}>=-3000")
+                if (f.get("ask_depth_usd") or 0) < 5000:
+                    why.append(f"PathB ask_d={f.get('ask_depth_usd')}<5000")
+                if (f.get("bid_depth_usd") or 0) < 5000:
+                    why.append(f"PathB bid_d={f.get('bid_depth_usd')}<5000")
+            else:
+                why.append(f"hl3m={hl}")
+            log.info(f"[SKIP] {coin} runner_dna_v1=False ({', '.join(why)})")
+            return
 
-        if variant == "R10_EXPLOSION_ONSET":
-            log.info(f"[R10] {coin} explosion onset — dv5m={sig.features.get('dv_5m_usd',0):,.0f} trend={sig.features.get('dv_trend_5m',0):.1f}x")
-        elif _r11:
-            # R12 gate: R11 criteria PLUS higher_lows_3m AND cvd_30s>0
-            _hl3m  = sig.features.get("higher_lows_3m")
-            _cvd30 = float(sig.features.get("cvd_30s", 0) or 0)
-            if _hl3m is None:
-                log.warning(f"[SKIP] {coin} R11: higher_lows_3m not in features — cannot evaluate R12 gate")
-                return
-            if _hl3m is not True or _cvd30 <= 0:
-                log.info(f"[SKIP] {coin} R11 no R12: higher_lows_3m={_hl3m} cvd_30s={_cvd30:.0f}")
-                return
-            log.info(f"[R12] {coin} step_2m={_s2m:.4f} spread={_spd:.1f}bps higher_lows=True cvd={_cvd30:.0f}")
-        elif variant == "R8_HIGH_CONVICTION":
-            # Detector enforces: whale>=50%, step>=0.5%, step_2m>=0.8%, rank<=5,
-            # ret_24h>=15%, dv_trend>=0.90. No additional executor gates needed.
-            # Diagnostic: only variant with positive EV at 0.5% friction (+0.429%, n=591)
-            log.info(
-                f"[R8] {coin} whale={sig.features.get('whale_pct_60s', 0):.2f} "
-                f"step_2m={_s2m:.4f} spread={_spd:.1f}bps rank={sig.features.get('rank_60s', 99)}"
-            )
-        else:
-            # Standard R7 precision stack (non-R11)
-            if sig.features.get("rank_60s", 99) != 1:
-                log.info(f"[SKIP] {coin} rank not 1")
-                return
-            if sig.features.get("cg_trending") is True:
-                log.info(f"[SKIP] {coin} cg_trending=True")
-                return
-            breadth = sig.features.get("market_breadth_5m", 0)
-            if not (3 <= breadth <= 10):
-                log.info(f"[SKIP] {coin} breadth={breadth} not 3-10")
-                return
-            if sig.features.get("signals_24h", 0) > 15:
-                log.info(f"[SKIP] {coin} signals_24h too high")
-                return
-
-        if variant == "R7_STAIRCASE" and not _r11:
-            if sig.features.get("step_2m", 0) <= 0.008:
-                log.info(f"[SKIP] {coin} R7 step_2m weak")
-                return
-            if sig.features.get("candle_close_str_1m", 0) <= 0.70:
-                log.info(f"[SKIP] {coin} R7 candle_close_str weak")
-                return
-
-        # BTC macro filter: R7 entries require BTC lifting relative to market
-        if variant == "R7_STAIRCASE":
-            _btc_rel = sig.features.get("btc_rel_ret_5m")
-            if _btc_rel is not None and _btc_rel < 0.02:
-                log.info(f"[SKIP] {coin} R7 btc_rel_ret_5m={_btc_rel:.4f} < 0.02 — BTC macro filter")
-                return
+        # ── ACCEPTED — write audit record so every entry decision is inspectable
+        f = sig.features
+        which_path = "A_continuation" if f.get("higher_lows_3m") is True else "B_absorption"
+        log.info(
+            f"[ACCEPT] {coin} variant={variant} path={which_path} "
+            f"btc_rel={f.get('btc_rel_ret_5m')} cvd_30s={f.get('cvd_30s')} "
+            f"hl3m={f.get('higher_lows_3m')} rank={f.get('rank_60s')} "
+            f"step_2m={f.get('step_2m')} ccs={f.get('candle_close_str_1m')} "
+            f"ask_d={f.get('ask_depth_usd')} bid_d={f.get('bid_depth_usd')}"
+        )
+        try:
+            audit_path = self._trade_log.parent / "live_entry_audit.jsonl"
+            with audit_path.open("a") as af:
+                af.write(json.dumps({
+                    "ts":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "ts_ns":   getattr(sig, "sig_ts_ns", None),
+                    "coin":    coin,
+                    "variant": variant,
+                    "path":    which_path,
+                    "sig_mid": getattr(sig, "sig_mid", None),
+                    "features": f,
+                }) + "\n")
+        except Exception as e:
+            log.error(f"[AUDIT-WRITE-FAIL] {coin}: {e}")
 
         # Per-coin cooldown gate: if this coin recently stopped us out or timed out at a
         # loss, require a minimum rest period before re-entering.

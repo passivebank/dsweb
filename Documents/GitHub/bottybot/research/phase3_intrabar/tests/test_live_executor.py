@@ -1442,12 +1442,14 @@ class TestEntryLoggingIntendedPx:
 
         sig = FakeSignal(coin="ZZ", variant="R7_STAIRCASE")
         sig.features.update({
-            "rank_60s": 1, "cg_trending": False, "market_breadth_5m": 5,
-            "signals_24h": 5,
-            # step_2m below R11 threshold (0.018) so we take the standard R7 path
-            # without the extra higher_lows_3m / cvd>0 gates.
-            "step_2m": 0.012, "candle_close_str_1m": 0.9,
-            "btc_rel_ret_5m": 0.05, "first_signal_today": True,
+            # Satisfy runner_dna_v1 Path A (continuation): higher_lows=True,
+            # step_2m >= 0.012, candle_close_str >= 0.70, rank <= 3, plus
+            # macro gates btc_rel_ret_5m >= 0.02 and signals_24h <= 15.
+            "higher_lows_3m": True, "rank_60s": 1, "step_2m": 0.02,
+            "candle_close_str_1m": 0.9, "btc_rel_ret_5m": 0.05,
+            "signals_24h": 5, "first_signal_today": True,
+            # legacy fields kept for completeness (no longer gated on)
+            "cg_trending": False, "market_breadth_5m": 5,
         })
         ex.on_signal(sig)
         time.sleep(0.4)
