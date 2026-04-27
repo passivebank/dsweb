@@ -1,0 +1,45 @@
+{
+  "features": [
+    "f_ret_24h",
+    "f_btc_rel_ret_5m",
+    "f_cvd_60s",
+    "f_book_imbalance_10",
+    "f_spread_bps",
+    "f_btc_dom_pct",
+    "f_vwap_300s",
+    "f_coin_signal_share",
+    "f_cvd_30s",
+    "f_ask_depth_trend",
+    "f_utc_hour",
+    "f_signals_24h"
+  ],
+  "medians": [
+    0.32371,
+    0.0131,
+    -257.68,
+    0.865,
+    12.4,
+    57.22,
+    0.10130703,
+    0.2608695652173913,
+    -64.64,
+    1.0,
+    10.0,
+    15.0
+  ],
+  "model_type": "lgbm",
+  "target_horizon": "fwd_max_5m",
+  "target_threshold": 0.05,
+  "default_prob_threshold": 0.5,
+  "default_hard_stop_pct": 0.015,
+  "trained_at": "2026-04-27",
+  "train_auc": 0.907316850490518,
+  "cv_auc": 0.6043288948876042,
+  "test_auc": 0.6934981684981685,
+  "scrutiny_passed": {
+    "train_cv_gap": 0.3029879556029138,
+    "regime_robustness": "median per-regime ret used in projection",
+    "cost_break_even_bps": "around +150bps extra (above baseline 84)",
+    "coin_concentration": "moderate \u2014 top 6 coins ~1/3 of P&L"
+  }
+}
