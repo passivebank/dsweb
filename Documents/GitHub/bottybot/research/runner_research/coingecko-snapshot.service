@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily CoinGecko snapshot of trading universe
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/phase3_intrabar
+Environment=PYTHONUNBUFFERED=1
+Environment=COINGECKO_SNAPSHOT_PATH=/home/ec2-user/phase3_intrabar/artifacts/coingecko_snapshot.jsonl
+Environment=COINGECKO_COIN_MAP_PATH=/home/ec2-user/phase3_intrabar/artifacts/coingecko_coin_map.json
+ExecStart=/home/ec2-user/phase3_intrabar/venv/bin/python -m research.runner_research.coingecko_snapshot --enrich-detail --max-detail 50
+StandardOutput=append:/home/ec2-user/phase3_intrabar/artifacts/coingecko_snapshot.log
+StandardError=append:/home/ec2-user/phase3_intrabar/artifacts/coingecko_snapshot.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily CoinGecko snapshot — 09:00 UTC
+Requires=coingecko-snapshot.service
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=coingecko-snapshot.service
+
+[Install]
+WantedBy=timers.target
