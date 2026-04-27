@@ -1,0 +1,12 @@
+[Unit]
+Description=Loss-streak watchdog every 5 minutes
+Requires=loss-streak-watchdog.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=loss-streak-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

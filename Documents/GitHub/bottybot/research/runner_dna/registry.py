@@ -223,6 +223,74 @@ def runner_dna_v2_sharpened(features: dict, variant: str) -> bool:
     return True
 
 
+# ── ML-based filter ─────────────────────────────────────────────────────────
+# LightGBM model trained on 14 days of shadow data targeting fwd_max_5m ≥ 5%.
+# Held-out 3-day test AUC: 0.735. Walk-forward CV AUC: 0.609.
+# Loaded lazily on first call to avoid import-time cost when not used.
+
+import os
+from pathlib import Path
+
+_ML_MODEL_DIR = Path(os.environ.get(
+    "ML_MODEL_DIR",
+    "/home/ec2-user/phase3_intrabar/research/runner_research/deploy",
+))
+_ml_state: dict = {}
+
+
+def _load_ml_model():
+    """Lazy load LightGBM model + feature schema. Cached after first call."""
+    if _ml_state:
+        return _ml_state
+    try:
+        import lightgbm as lgb
+        import json as _json
+        meta = _json.loads((_ML_MODEL_DIR / "features.json").read_text())
+        _ml_state["booster"] = lgb.Booster(model_file=str(_ML_MODEL_DIR / "model.txt"))
+        _ml_state["features"] = meta["features"]
+        _ml_state["medians"] = meta["medians"]
+        _ml_state["prob_threshold"] = float(meta.get("default_prob_threshold", 0.40))
+    except Exception as e:
+        _ml_state["error"] = str(e)
+    return _ml_state
+
+
+def ml_runner_v1(features: dict, variant: str) -> bool:
+    """ML filter: passes when model says P(fwd_max_5m ≥ 5%) ≥ threshold.
+
+    Trained 2026-04-27 on 14 days of shadow data. Variant whitelist still
+    enforced upstream by live_executor (R7/R8/R10 only). Threshold default
+    0.40 — tuned for max held-out total return.
+    """
+    s = _load_ml_model()
+    if s.get("error") or "booster" not in s:
+        return False
+    feature_list = s["features"]
+    medians = s["medians"]
+    # Build vector
+    import numpy as _np
+    X = _np.zeros((1, len(feature_list)))
+    for i, fname in enumerate(feature_list):
+        v = features.get(fname.replace("f_", ""))
+        if v is None:
+            v = features.get(fname)
+        if v is None:
+            X[0, i] = float(medians[fname])
+            continue
+        if isinstance(v, bool):
+            X[0, i] = 1.0 if v else 0.0
+            continue
+        try:
+            X[0, i] = float(v)
+        except (TypeError, ValueError):
+            X[0, i] = float(medians[fname])
+    try:
+        prob = float(s["booster"].predict(X)[0])
+    except Exception:
+        return False
+    return prob >= s["prob_threshold"]
+
+
 # ── REGISTRY ────────────────────────────────────────────────────────────────
 # name → (callable, description)
 REGISTRY: dict[str, tuple[Callable, str]] = {
@@ -235,6 +303,8 @@ REGISTRY: dict[str, tuple[Callable, str]] = {
     "champion_v1_legacy": (champion_v1_legacy, "old precision filter — baseline"),
     "runner_dna_v2_sharpened": (runner_dna_v2_sharpened,
         "v1 + spread≥14bps + ask_d≤9k + step_2m≥0.015 — first filter with positive CI lo"),
+    "ml_runner_v1": (ml_runner_v1,
+        "LightGBM P(fwd_max_5m ≥ 5%) ≥ 0.40 — held-out AUC 0.735, walk-forward 0.609"),
 }
 
 
