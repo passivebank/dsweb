@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily perp snapshot — 09:30 UTC (offset from coingecko 09:00)
+Requires=perp-snapshot.service
+
+[Timer]
+OnCalendar=*-*-* 09:30:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=perp-snapshot.service
+
+[Install]
+WantedBy=timers.target

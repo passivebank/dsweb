@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily perp futures snapshot (OKX funding + OI)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+WorkingDirectory=/home/ec2-user/phase3_intrabar
+Environment=PYTHONUNBUFFERED=1
+Environment=PHASE3_ARTIFACTS=/home/ec2-user/phase3_intrabar/artifacts
+ExecStart=/home/ec2-user/phase3_intrabar/venv/bin/python -m research.runner_research.perp_enrichment snapshot
+StandardOutput=append:/home/ec2-user/phase3_intrabar/artifacts/perp_snapshot.log
+StandardError=append:/home/ec2-user/phase3_intrabar/artifacts/perp_snapshot.log
+
+[Install]
+WantedBy=multi-user.target
