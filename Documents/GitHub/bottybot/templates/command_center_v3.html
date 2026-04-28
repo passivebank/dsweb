@@ -255,6 +255,15 @@ tr:hover td { background: #0f1828; }
     </div>
   </div>
 
+  <!-- ── v3 alpha (disagreement vs live champion) ── -->
+  <div class="row">
+    <div class="card flex-1">
+      <div class="card-title">◆ v3 Alpha — disagreements vs live champion</div>
+      <div id="v3-alpha-summary" style="font-size:12px;line-height:1.6">—</div>
+      <div id="v3-alpha-recent" style="margin-top:10px;font-size:11px"></div>
+    </div>
+  </div>
+
   <!-- ── Models performance ── -->
   <div class="row">
     <div class="card flex-3">
@@ -884,6 +893,66 @@ function renderChampion(d) {
   }
 }
 
+async function fetchV3Alpha() {
+  try {
+    const d = await (await fetch('/api/v3_alpha')).json();
+    renderV3Alpha(d);
+  } catch (e) { console.error('v3_alpha', e); }
+}
+
+function fmtBucket(b) {
+  if (!b || b.n_with_outcome == null || b.n_with_outcome === 0) {
+    return `n=${b ? b.n : 0} <span style="color:var(--muted)">(no outcomes yet)</span>`;
+  }
+  const meanCls = b.mean_net > 0 ? 'pos' : (b.mean_net < 0 ? 'neg' : '');
+  const totCls  = b.total_net > 0 ? 'pos' : (b.total_net < 0 ? 'neg' : '');
+  return `n=${b.n} (out=${b.n_with_outcome}) · WR ${(b.win_rate*100).toFixed(1)}% · `
+       + `mean <span class="${meanCls}">${(b.mean_net*100).toFixed(2)}%</span> · `
+       + `total <span class="${totCls}">${(b.total_net*100).toFixed(2)}%</span>`;
+}
+
+function renderV3Alpha(d) {
+  const latest = d.latest;
+  if (!latest) {
+    $('v3-alpha-summary').innerHTML = '<span style="color:var(--muted)">Tracker hasn\'t run yet — first run scheduled.</span>';
+    $('v3-alpha-recent').innerHTML = '';
+    return;
+  }
+  const va = latest.v3_alpha || {};
+  const html = `
+    <div>Window: <b>${latest.window_days}d</b> · live champion: <b class="pos">${latest.live_champion}</b> · examined ${latest.n_examined} signals (${latest.n_v3_tagged} v3-tagged)</div>
+    <div style="margin-top:6px">★ <b>BOTH_ACCEPT</b> (no disagreement): ${fmtBucket(va.BOTH_ACCEPT)}</div>
+    <div>◆ <b>V3_ONLY</b> (v3 yes, live no): ${fmtBucket(va.V3_ONLY)}</div>
+    <div>● <b>LIVE_ONLY</b> (live yes, v3 no): ${fmtBucket(va.LIVE_ONLY)}</div>
+    <div style="color:var(--muted)">  BOTH_REJECT: ${fmtBucket(va.BOTH_REJECT)}</div>
+  `;
+  $('v3-alpha-summary').innerHTML = html;
+
+  const v3only = latest.v3_only_recent || [];
+  if (v3only.length) {
+    let h = '<div style="color:var(--muted);margin-bottom:4px">recent V3_ONLY accepts (v3 caught these, live champion missed):</div>';
+    h += '<table style="width:100%;font-size:10px;border-collapse:collapse">';
+    h += '<tr style="color:var(--muted);text-align:right"><th style="text-align:left">time</th><th style="text-align:left">coin</th><th>v3 score</th><th>fwd_max</th><th>smart_trail_net</th></tr>';
+    for (const r of v3only.slice(-10).reverse()) {
+      const ts = new Date(r.sig_ts_ns / 1e6).toISOString().slice(11, 19);
+      const fwdMax = r.fwd_max != null ? (r.fwd_max*100).toFixed(2)+'%' : '—';
+      const stn = r.smart_trail_net != null ? (r.smart_trail_net*100).toFixed(2)+'%' : '—';
+      const stnCls = r.smart_trail_net > 0 ? 'pos' : (r.smart_trail_net < 0 ? 'neg' : '');
+      h += `<tr style="border-top:1px solid var(--border);text-align:right">
+        <td style="text-align:left">${ts}</td>
+        <td style="text-align:left">${r.coin}</td>
+        <td>${r.v3_score.toFixed(3)}</td>
+        <td>${fwdMax}</td>
+        <td class="${stnCls}">${stn}</td>
+      </tr>`;
+    }
+    h += '</table>';
+    $('v3-alpha-recent').innerHTML = h;
+  } else {
+    $('v3-alpha-recent').innerHTML = '<div style="color:var(--muted);font-size:10px">No V3_ONLY signals captured yet.</div>';
+  }
+}
+
 async function fetchModels() {
   try {
     const d = await (await fetch('/api/models')).json();
@@ -972,7 +1041,7 @@ function toast(msg) {
 
 async function refreshAll() {
   $('last-refresh').textContent = 'refreshing…';
-  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat(), fetchChampion(), fetchModels()]);
+  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat(), fetchChampion(), fetchModels(), fetchV3Alpha()]);
   $('last-refresh').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
@@ -1003,6 +1072,7 @@ setInterval(fetchLog,       10000);
 setInterval(fetchHeartbeat, 15000);
 setInterval(fetchChampion,  60000);
 setInterval(fetchModels,    90000);
+setInterval(fetchV3Alpha,   120000);
 </script>
 </body>
 </html>

@@ -24,6 +24,7 @@ LIVE_FILTER_CONFIG  = "/home/ec2-user/phase3_intrabar/live_filter_config.json"
 CHALLENGER_SCORES   = "/home/ec2-user/phase3_intrabar/artifacts/challenger_scores.json"
 PROMOTION_LOG       = "/home/ec2-user/phase3_intrabar/artifacts/promotion_log.jsonl"
 V3_SHADOW_TRACK     = "/home/ec2-user/phase3_intrabar/artifacts/v3_shadow_track.jsonl"
+V3_ALPHA_PATH       = "/home/ec2-user/phase3_intrabar/artifacts/v3_alpha.jsonl"
 
 # Auto-detect: if running ON the EC2, files are local; otherwise SSH
 LOCAL = Path(LIVE_TRADES).exists()
@@ -664,6 +665,25 @@ def api_models():
         "v3_history":      v3_history[-10:],
         "v3_meta":         v3_meta,
         "promotions":      promotions[-10:],
+    })
+
+
+@app.get("/api/v3_alpha")
+def api_v3_alpha():
+    """Latest v3 vs live-champion disagreement summary.
+
+    Returns last entry from v3_alpha.jsonl plus the recent V3_ONLY signals
+    (v3 said yes, live champion said no — these are the trades v3 would
+    have caught that the current bot missed).
+    """
+    raw = run_remote(f"tail -n 5 {V3_ALPHA_PATH} 2>/dev/null", "v3_alpha", ttl=120)
+    entries = []
+    for line in raw.strip().splitlines():
+        try: entries.append(json.loads(line))
+        except Exception: continue
+    return _scrub_nan({
+        "history": entries,
+        "latest":  entries[-1] if entries else None,
     })
 
 

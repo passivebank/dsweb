@@ -1,0 +1,12 @@
+[Unit]
+Description=v3 alpha tracker every 4h
+Requires=v3-alpha-tracker.service
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=4h
+Unit=v3-alpha-tracker.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
