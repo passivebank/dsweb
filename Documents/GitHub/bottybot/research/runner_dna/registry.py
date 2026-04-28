@@ -291,6 +291,77 @@ def ml_runner_v1(features: dict, variant: str) -> bool:
     return prob >= s["prob_threshold"]
 
 
+# ── ml_runner_v3: SHADOW-ONLY filter — robust LGBM with regularization ─────
+# Trained 2026-04-27 with strong regularization. 12 features. Train AUC 0.91,
+# CV AUC 0.60, held-out test AUC 0.69. NOT YET LIVE — wired into registry so
+# every signal can be tagged for shadow tracking against actual outcomes.
+_ML_V3_DIR = Path(os.environ.get(
+    "ML_V3_DIR",
+    "/home/ec2-user/phase3_intrabar/research/runner_research/v3_deploy",
+))
+_ml_v3_state: dict = {}
+
+
+def _load_ml_v3_model():
+    if _ml_v3_state:
+        return _ml_v3_state
+    try:
+        import lightgbm as lgb
+        import json as _json
+        meta = _json.loads((_ML_V3_DIR / "features.json").read_text())
+        _ml_v3_state["booster"] = lgb.Booster(model_file=str(_ML_V3_DIR / "model.txt"))
+        _ml_v3_state["features"] = meta["features"]
+        _ml_v3_state["medians"] = {f: m for f, m in zip(meta["features"], meta["medians"])} \
+                                    if isinstance(meta["medians"], list) else meta["medians"]
+        _ml_v3_state["prob_threshold"] = float(meta.get("default_prob_threshold", 0.50))
+    except Exception as e:
+        _ml_v3_state["error"] = str(e)
+    return _ml_v3_state
+
+
+def ml_runner_v3_score(features: dict) -> float | None:
+    """Return the v3 model's predicted probability — or None on load failure.
+    Used by shadow tracker to record continuous score, not just binary.
+    """
+    s = _load_ml_v3_model()
+    if s.get("error") or "booster" not in s:
+        return None
+    feature_list = s["features"]
+    medians = s["medians"]
+    import numpy as _np
+    X = _np.zeros((1, len(feature_list)))
+    for i, fname in enumerate(feature_list):
+        v = features.get(fname.replace("f_", ""))
+        if v is None: v = features.get(fname)
+        if v is None:
+            X[0, i] = float(medians.get(fname, 0.0))
+            continue
+        if isinstance(v, bool):
+            X[0, i] = 1.0 if v else 0.0
+            continue
+        try:
+            X[0, i] = float(v)
+        except (TypeError, ValueError):
+            X[0, i] = float(medians.get(fname, 0.0))
+    try:
+        return float(s["booster"].predict(X)[0])
+    except Exception:
+        return None
+
+
+def ml_runner_v3(features: dict, variant: str) -> bool:
+    """v3 ML filter — shadow-tagged on every signal but NOT live yet.
+
+    This filter exists to record what v3 WOULD have done. Earned its way to
+    live promotion only after 14-30 days of real shadow data confirms the
+    +5%/5min target hits at the projected rate.
+    """
+    p = ml_runner_v3_score(features)
+    if p is None: return False
+    s = _load_ml_v3_model()
+    return p >= s.get("prob_threshold", 0.50)
+
+
 # ── REGISTRY ────────────────────────────────────────────────────────────────
 # name → (callable, description)
 REGISTRY: dict[str, tuple[Callable, str]] = {
@@ -305,6 +376,8 @@ REGISTRY: dict[str, tuple[Callable, str]] = {
         "v1 + spread≥14bps + ask_d≤9k + step_2m≥0.015 — first filter with positive CI lo"),
     "ml_runner_v1": (ml_runner_v1,
         "LightGBM P(fwd_max_5m ≥ 5%) ≥ 0.40 — held-out AUC 0.735, walk-forward 0.609"),
+    "ml_runner_v3": (ml_runner_v3,
+        "LightGBM (regularized, 12 feats) P(fwd_max_5m ≥ 5%) ≥ 0.50 — train AUC 0.91, CV 0.60, test 0.69"),
 }
 
 

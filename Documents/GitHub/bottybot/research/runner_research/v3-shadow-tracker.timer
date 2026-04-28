@@ -1,0 +1,12 @@
+[Unit]
+Description=v3 shadow tracker every 6h
+Requires=v3-shadow-tracker.service
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+Unit=v3-shadow-tracker.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

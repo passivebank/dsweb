@@ -631,17 +631,30 @@ class Recorder:
                 pass
 
         # ── runner_dna_v1 candidate-filter shadow tag ───────────────
-        # Tag every signal with whether the candidate filter would accept it,
-        # so we can compare its forward performance to champion_v1 over
-        # accumulating out-of-sample data without changing live execution.
-        # Wrapped in try/except so a filter bug never breaks the signal
-        # pipeline.
         try:
             sig.features["runner_dna_v1"] = bool(
                 runner_dna_v1_passes(sig.features, sig.variant)
             )
         except Exception:
             sig.features["runner_dna_v1"] = False
+
+        # ── ml_runner_v3 candidate-filter shadow tag (continuous score) ──
+        # Records v3 predicted probability + binary accept on every signal.
+        # NOT a live filter yet. Used by daily tracker to compare v3 calls
+        # against actual forward outcomes.
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _v3_dir = _Path(__file__).resolve().parent.parent
+            if str(_v3_dir) not in _sys.path:
+                _sys.path.insert(0, str(_v3_dir))
+            from research.runner_dna.registry import ml_runner_v3_score, ml_runner_v3
+            v3_p = ml_runner_v3_score(sig.features)
+            if v3_p is not None:
+                sig.features["ml_runner_v3_score"] = round(v3_p, 6)
+                sig.features["ml_runner_v3"] = bool(ml_runner_v3(sig.features, sig.variant))
+        except Exception:
+            pass
 
         # ── Persist the signal ──────────────────────────────────────
         with self.signal_log.open("a") as f:
