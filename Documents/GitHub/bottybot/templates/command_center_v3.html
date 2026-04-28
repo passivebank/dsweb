@@ -264,6 +264,15 @@ tr:hover td { background: #0f1828; }
     </div>
   </div>
 
+  <!-- ── Per-coin scorecard ── -->
+  <div class="row">
+    <div class="card flex-3">
+      <div class="card-title">Per-Coin Scorecard (7d simulated smart-trail)</div>
+      <div id="per-coin-meta" style="font-size:11px;color:var(--muted);margin-bottom:6px">—</div>
+      <div id="per-coin-table" style="font-size:11px"></div>
+    </div>
+  </div>
+
   <!-- ── Models performance ── -->
   <div class="row">
     <div class="card flex-3">
@@ -893,6 +902,68 @@ function renderChampion(d) {
   }
 }
 
+async function fetchPerCoin() {
+  try {
+    const d = await (await fetch('/api/per_coin')).json();
+    renderPerCoin(d);
+  } catch (e) { console.error('per_coin', e); }
+}
+
+function renderPerCoin(d) {
+  if (!d.per_coin) {
+    $('per-coin-table').innerHTML = '<span style="color:var(--muted)">No scorecard yet — runs daily 10:00 UTC.</span>';
+    return;
+  }
+  $('per-coin-meta').innerHTML = `${d.n_coins} coins tracked · max window ${d.max_window_days}d · snapshot ${d.ts_utc}`;
+  const arr = Object.values(d.per_coin || {})
+    .filter(c => (c.stats_7d || {}).n > 0)
+    .sort((a, b) => (b.stats_7d.total_net || 0) - (a.stats_7d.total_net || 0));
+  if (!arr.length) {
+    $('per-coin-table').innerHTML = '<span style="color:var(--muted)">No 7d data yet.</span>';
+    return;
+  }
+  let h = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">';
+  h += '<tr style="color:var(--muted);text-align:right">';
+  h += '<th style="text-align:left">coin</th><th>7d sigs</th><th>WR</th><th>mean net</th><th>total %</th><th>5% hit rate</th><th>days since runner</th></tr>';
+  // Top 15 winners
+  for (const c of arr.slice(0, 15)) {
+    const s = c.stats_7d;
+    const wrCls = s.win_rate >= 0.5 ? 'pos' : (s.win_rate < 0.4 ? 'neg' : '');
+    const meanCls = s.mean_net > 0 ? 'pos' : 'neg';
+    const totCls = s.total_net > 0 ? 'pos' : 'neg';
+    const dsr = c.days_since_runner != null ? c.days_since_runner.toFixed(1) + 'd' : '—';
+    h += `<tr style="border-top:1px solid var(--border);text-align:right">
+      <td style="text-align:left"><b>${c.coin}</b></td>
+      <td>${s.n}</td>
+      <td class="${wrCls}">${(s.win_rate*100).toFixed(1)}%</td>
+      <td class="${meanCls}">${(s.mean_net*100).toFixed(2)}%</td>
+      <td class="${totCls}">${(s.total_net*100).toFixed(1)}%</td>
+      <td>${(s.hit_5pct_rate*100).toFixed(1)}%</td>
+      <td>${dsr}</td>
+    </tr>`;
+  }
+  // Section divider + bottom 8 losers
+  h += '<tr><td colspan="7" style="color:var(--muted);font-size:10px;padding-top:6px">━━━ losers (consider skipping) ━━━</td></tr>';
+  for (const c of arr.slice(-8).reverse()) {
+    const s = c.stats_7d;
+    const wrCls = s.win_rate < 0.4 ? 'neg' : '';
+    const meanCls = s.mean_net < 0 ? 'neg' : '';
+    const totCls = s.total_net < 0 ? 'neg' : '';
+    const dsr = c.days_since_runner != null ? c.days_since_runner.toFixed(1) + 'd' : '—';
+    h += `<tr style="border-top:1px solid var(--border);text-align:right">
+      <td style="text-align:left">${c.coin}</td>
+      <td>${s.n}</td>
+      <td class="${wrCls}">${(s.win_rate*100).toFixed(1)}%</td>
+      <td class="${meanCls}">${(s.mean_net*100).toFixed(2)}%</td>
+      <td class="${totCls}">${(s.total_net*100).toFixed(1)}%</td>
+      <td>${(s.hit_5pct_rate*100).toFixed(1)}%</td>
+      <td>${dsr}</td>
+    </tr>`;
+  }
+  h += '</table></div>';
+  $('per-coin-table').innerHTML = h;
+}
+
 async function fetchV3Alpha() {
   try {
     const d = await (await fetch('/api/v3_alpha')).json();
@@ -1041,7 +1112,7 @@ function toast(msg) {
 
 async function refreshAll() {
   $('last-refresh').textContent = 'refreshing…';
-  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat(), fetchChampion(), fetchModels(), fetchV3Alpha()]);
+  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat(), fetchChampion(), fetchModels(), fetchV3Alpha(), fetchPerCoin()]);
   $('last-refresh').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
@@ -1073,6 +1144,7 @@ setInterval(fetchHeartbeat, 15000);
 setInterval(fetchChampion,  60000);
 setInterval(fetchModels,    90000);
 setInterval(fetchV3Alpha,   120000);
+setInterval(fetchPerCoin,   180000);
 </script>
 </body>
 </html>

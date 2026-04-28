@@ -1,0 +1,12 @@
+[Unit]
+Description=Per-coin scorecard daily 10:00 UTC
+Requires=per-coin-scorecard.service
+
+[Timer]
+OnCalendar=*-*-* 10:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=per-coin-scorecard.service
+
+[Install]
+WantedBy=timers.target

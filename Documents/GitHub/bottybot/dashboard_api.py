@@ -25,6 +25,7 @@ CHALLENGER_SCORES   = "/home/ec2-user/phase3_intrabar/artifacts/challenger_score
 PROMOTION_LOG       = "/home/ec2-user/phase3_intrabar/artifacts/promotion_log.jsonl"
 V3_SHADOW_TRACK     = "/home/ec2-user/phase3_intrabar/artifacts/v3_shadow_track.jsonl"
 V3_ALPHA_PATH       = "/home/ec2-user/phase3_intrabar/artifacts/v3_alpha.jsonl"
+PER_COIN_LATEST     = "/home/ec2-user/phase3_intrabar/artifacts/per_coin_scorecard_latest.json"
 
 # Auto-detect: if running ON the EC2, files are local; otherwise SSH
 LOCAL = Path(LIVE_TRADES).exists()
@@ -685,6 +686,16 @@ def api_v3_alpha():
         "history": entries,
         "latest":  entries[-1] if entries else None,
     })
+
+
+@app.get("/api/per_coin")
+def api_per_coin():
+    """Per-coin scorecard — 7d/14d/30d rolling stats."""
+    try:
+        snap = json.loads(read_file(PER_COIN_LATEST, "per_coin_latest", ttl=120))
+    except Exception:
+        return {"error": "no scorecard snapshot yet", "per_coin": {}}
+    return _scrub_nan(snap)
 
 
 @app.get("/api/heartbeat")
