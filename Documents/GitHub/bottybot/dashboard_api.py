@@ -23,6 +23,7 @@ HEARTBEAT           = "/home/ec2-user/phase3_intrabar/artifacts/recorder_heartbe
 LIVE_FILTER_CONFIG  = "/home/ec2-user/phase3_intrabar/live_filter_config.json"
 CHALLENGER_SCORES   = "/home/ec2-user/phase3_intrabar/artifacts/challenger_scores.json"
 PROMOTION_LOG       = "/home/ec2-user/phase3_intrabar/artifacts/promotion_log.jsonl"
+V3_SHADOW_TRACK     = "/home/ec2-user/phase3_intrabar/artifacts/v3_shadow_track.jsonl"
 
 # Auto-detect: if running ON the EC2, files are local; otherwise SSH
 LOCAL = Path(LIVE_TRADES).exists()
@@ -508,6 +509,161 @@ def api_champion():
         "config":     cfg,
         "scores":     scores,
         "promotions": promotions[-10:],
+    })
+
+
+@app.get("/api/models")
+def api_models():
+    """Comprehensive view of every model's performance.
+
+    For the LIVE champion: pulls real fills from live_trades.jsonl.
+    For all other registry filters: pulls shadow scores from
+    challenger_scores.json (rolling 7d).
+    For ml_runner_v3: also pulls v3_shadow_track.jsonl history.
+    """
+    # ── 1. live config (current champion) ────────────────────────────
+    cfg = {}
+    try:
+        cfg = json.loads(read_file(LIVE_FILTER_CONFIG, "live_filter_cfg", ttl=15))
+    except Exception:
+        pass
+    live_champion = cfg.get("champion")
+
+    # ── 2. challenger scores (every model in registry, 7d shadow) ───
+    challenger_scores = {}
+    try:
+        challenger_scores = json.loads(read_file(CHALLENGER_SCORES, "challenger_scores", ttl=60))
+    except Exception:
+        pass
+    scores = challenger_scores.get("scores", {})
+    scored_at = challenger_scores.get("scored_at_utc")
+    window_days = challenger_scores.get("window_days")
+
+    # ── 3. live champion's REAL trade history (post last_promotion_ts) ──
+    live_trade_summary = None
+    promo_ts = cfg.get("last_promotion_ts")
+    if live_champion and promo_ts:
+        try:
+            raw = read_file(LIVE_TRADES, "live_trades", ttl=25)
+            entries = []
+            exits = []
+            for line in raw.strip().splitlines():
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                ts = ev.get("entry_ts") or ev.get("ts") or ev.get("exit_ts")
+                if not ts or ts < promo_ts:
+                    continue
+                if ev.get("event") == "ENTRY":
+                    entries.append(ev)
+                elif ev.get("event") == "EXIT":
+                    exits.append(ev)
+            wins = [e for e in exits if (e.get("gain") or e.get("net_pct") or 0) > 0]
+            losses = [e for e in exits if (e.get("gain") or e.get("net_pct") or 0) <= 0]
+            total_gain = sum((e.get("gain") or e.get("net_pct") or 0) for e in exits)
+            mean_gain  = total_gain / len(exits) if exits else 0.0
+            live_trade_summary = {
+                "entries":           len(entries),
+                "exits":             len(exits),
+                "wins":              len(wins),
+                "losses":            len(losses),
+                "win_rate":          (len(wins) / len(exits)) if exits else None,
+                "mean_gain":         mean_gain,
+                "total_gain_pct":    total_gain,
+                "since":             promo_ts,
+            }
+        except Exception:
+            pass
+
+    # ── 4. v3 shadow tracker history (last entry) ───────────────────
+    v3_history = []
+    try:
+        raw = run_remote(f"tail -n 30 {V3_SHADOW_TRACK} 2>/dev/null", "v3_track", ttl=120)
+        for line in raw.strip().splitlines():
+            try: v3_history.append(json.loads(line))
+            except Exception: continue
+    except Exception:
+        pass
+
+    # ── 5. promotion log (when each champion took over) ─────────────
+    promotions = []
+    try:
+        raw = run_remote(f"tail -n 30 {PROMOTION_LOG} 2>/dev/null", "promotions_log", ttl=120)
+        for line in raw.strip().splitlines():
+            try: promotions.append(json.loads(line))
+            except Exception: continue
+    except Exception:
+        pass
+
+    # ── 6. Per-model rollup ─────────────────────────────────────────
+    models = []
+    for name, s in scores.items():
+        is_live = (name == live_champion)
+        entry = {
+            "name":            name,
+            "is_live":         is_live,
+            "mode":            "LIVE" if is_live else "shadow",
+            "description":     s.get("description"),
+            "n_trades":        s.get("n_trades", 0),
+            "n_days":          s.get("n_days", 0),
+            "win_rate":        s.get("win_rate"),
+            "mean_net_pct":    s.get("mean_net_pct"),
+            "median_net_pct":  s.get("median_net_pct"),
+            "ci_lo":           s.get("mean_net_ci_lo"),
+            "ci_hi":           s.get("mean_net_ci_hi"),
+            "total_return_pct": s.get("total_return_pct"),
+            "max_dd_pct":      s.get("max_drawdown_pct"),
+            "sharpe":          s.get("daily_sharpe"),
+        }
+        if is_live and live_trade_summary:
+            entry["live_trades"] = live_trade_summary
+        models.append(entry)
+
+    # Models in registry that don't have scores yet (e.g. ml_runner_v3 just deployed)
+    # Surface them too, marked as 'awaiting_data'.
+    KNOWN_MODELS = [
+        ("runner_dna_v1",         "current — base 2-path filter"),
+        ("runner_dna_strict",     "stricter than v1"),
+        ("runner_dna_loose",      "more permissive than v1"),
+        ("runner_dna_cont",       "Path A continuation only"),
+        ("runner_dna_abs",        "Path B absorption only"),
+        ("combined_or",           "v1 OR legacy precision"),
+        ("champion_v1_legacy",    "old precision filter — baseline"),
+        ("runner_dna_v2_sharpened","sharpened: spread≥14 + ask_d≤9k + step≥0.015"),
+        ("ml_runner_v1",          "LightGBM 25-feat — held-out AUC 0.735"),
+        ("ml_runner_v3",          "LightGBM 12-feat regularized — train 0.91 / CV 0.60 / test 0.69"),
+    ]
+    seen = {m["name"] for m in models}
+    for name, desc in KNOWN_MODELS:
+        if name in seen: continue
+        models.append({
+            "name":        name,
+            "is_live":     (name == live_champion),
+            "mode":        "LIVE" if name == live_champion else "shadow (awaiting data)",
+            "description": desc,
+            "n_trades":    0,
+        })
+
+    # v3 metadata
+    v3_meta = None
+    try:
+        v3_meta = json.loads(read_file(
+            "/home/ec2-user/phase3_intrabar/research/runner_research/v3_deploy/features.json",
+            "v3_features", ttl=300,
+        ))
+    except Exception:
+        pass
+
+    return _scrub_nan({
+        "live_champion":   live_champion,
+        "halt":            cfg.get("halt"),
+        "scored_at_utc":   scored_at,
+        "scoring_window_days": window_days,
+        "models":          models,
+        "v3_history":      v3_history[-10:],
+        "v3_meta":         v3_meta,
+        "promotions":      promotions[-10:],
     })
 
 

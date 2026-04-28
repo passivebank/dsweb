@@ -255,6 +255,33 @@ tr:hover td { background: #0f1828; }
     </div>
   </div>
 
+  <!-- ── Models performance ── -->
+  <div class="row">
+    <div class="card flex-3">
+      <div class="card-title">All Models — Live + Shadow Performance</div>
+      <div id="models-meta" style="font-size:11px;color:var(--muted);margin-bottom:8px">—</div>
+      <div id="models-table-wrap" style="overflow-x:auto;font-size:11px">
+        <table style="width:100%;border-collapse:collapse" id="models-table">
+          <thead>
+            <tr style="color:var(--muted);text-align:right">
+              <th style="text-align:left">model</th>
+              <th>mode</th>
+              <th>n trades</th>
+              <th>days</th>
+              <th>WR</th>
+              <th>mean net</th>
+              <th>CI lo</th>
+              <th>total %</th>
+              <th>Sharpe</th>
+            </tr>
+          </thead>
+          <tbody id="models-tbody"></tbody>
+        </table>
+      </div>
+      <div id="v3-history" style="margin-top:10px;font-size:11px"></div>
+    </div>
+  </div>
+
   <!-- ── Exit slippage: smart-exit (limit-then-market) vs legacy market ── -->
   <div class="row">
     <div class="card flex-1">
@@ -857,6 +884,71 @@ function renderChampion(d) {
   }
 }
 
+async function fetchModels() {
+  try {
+    const d = await (await fetch('/api/models')).json();
+    renderModels(d);
+  } catch (e) { console.error('models', e); }
+}
+
+function renderModels(d) {
+  const live = d.live_champion;
+  const meta = `Scored at: ${d.scored_at_utc || '—'} · window: ${d.scoring_window_days || '?'}d · live champion: <b class="pos">${live || '—'}</b>` +
+                (d.halt ? ' · <span class="neg">⏸ HALTED</span>' : '');
+  $('models-meta').innerHTML = meta;
+  // Order: live first, then by total_return, then awaiting
+  const ms = (d.models || []).slice().sort((a, b) => {
+    if (a.is_live !== b.is_live) return a.is_live ? -1 : 1;
+    const ta = (a.total_return_pct == null) ? -9999 : a.total_return_pct;
+    const tb = (b.total_return_pct == null) ? -9999 : b.total_return_pct;
+    return tb - ta;
+  });
+  if (!ms.length) { $('models-tbody').innerHTML = '<tr><td colspan="9" style="color:var(--muted)">No data yet.</td></tr>'; }
+  else {
+    $('models-tbody').innerHTML = ms.map(m => {
+      const star = m.is_live ? '★ ' : (m.name === 'ml_runner_v3' ? '◆ ' : '  ');
+      const modeCls = m.is_live ? 'pos' : '';
+      const wrCls = (m.win_rate || 0) >= 0.5 ? 'pos' : ((m.win_rate || 0) > 0 && (m.win_rate || 0) < 0.4 ? 'neg' : '');
+      const meanCls = (m.mean_net_pct || 0) > 0 ? 'pos' : ((m.mean_net_pct || 0) < 0 ? 'neg' : '');
+      const totCls = (m.total_return_pct || 0) > 0 ? 'pos' : ((m.total_return_pct || 0) < 0 ? 'neg' : '');
+      const ciLo = m.ci_lo != null ? (m.ci_lo * 100).toFixed(2) + '%' : '—';
+      const ciCls = (m.ci_lo || 0) > 0 ? 'pos' : (m.ci_lo != null && m.ci_lo < 0 ? 'neg' : '');
+      const desc = m.description ? `<span style="color:var(--muted);font-size:10px">${m.description}</span>` : '';
+      const liveDetail = (m.is_live && m.live_trades) ?
+        `<div style="margin-top:4px;color:var(--muted)">live: ${m.live_trades.entries}E/${m.live_trades.exits}X · ${m.live_trades.wins}W/${m.live_trades.losses}L · total ${(m.live_trades.total_gain_pct*100).toFixed(2)}% since ${(m.live_trades.since||'').slice(0,10)}</div>` : '';
+      return `<tr style="border-top:1px solid var(--border);text-align:right">
+        <td style="text-align:left"><b>${star}${m.name}</b><br>${desc}${liveDetail}</td>
+        <td><span class="${modeCls}">${m.mode}</span></td>
+        <td>${m.n_trades || 0}</td>
+        <td>${m.n_days || 0}</td>
+        <td class="${wrCls}">${m.win_rate != null ? (m.win_rate*100).toFixed(1)+'%' : '—'}</td>
+        <td class="${meanCls}">${m.mean_net_pct != null ? (m.mean_net_pct*100).toFixed(2)+'%' : '—'}</td>
+        <td class="${ciCls}">${ciLo}</td>
+        <td class="${totCls}">${m.total_return_pct != null ? m.total_return_pct.toFixed(2)+'%' : '—'}</td>
+        <td>${m.sharpe != null ? m.sharpe.toFixed(1) : '—'}</td>
+      </tr>`;
+    }).join('');
+  }
+  // v3 specific history
+  if (d.v3_history && d.v3_history.length) {
+    const last = d.v3_history[d.v3_history.length - 1];
+    const trend = d.v3_history.slice(-5).map(h => (h.mean_net*100).toFixed(2)+'%').join(' → ');
+    const v3meta = d.v3_meta || {};
+    $('v3-history').innerHTML = `<div style="background:#0a1424;padding:8px;border-radius:4px;margin-top:8px;border-left:3px solid var(--accent)">
+      <b>◆ ml_runner_v3 (shadow only):</b><br>
+      <span style="color:var(--muted)">train AUC ${(v3meta.train_auc||0).toFixed(3)} · CV ${(v3meta.cv_auc||0).toFixed(3)} · test ${(v3meta.test_auc||0).toFixed(3)} · prob threshold ${v3meta.default_prob_threshold || '?'}</span><br>
+      Latest: n=${last.n_with_outcome || 0} · WR ${((last.win_rate||0)*100).toFixed(1)}% · mean net ${((last.mean_net||0)*100).toFixed(2)}% · CI [${((last.ci_lo||0)*100).toFixed(2)}%, ${((last.ci_hi||0)*100).toFixed(2)}%]<br>
+      Recent runs (mean net): ${trend}
+    </div>`;
+  } else {
+    const v3meta = d.v3_meta || {};
+    $('v3-history').innerHTML = `<div style="background:#0a1424;padding:8px;border-radius:4px;margin-top:8px;border-left:3px solid var(--accent);color:var(--muted)">
+      <b>◆ ml_runner_v3 (shadow only)</b> — train AUC ${(v3meta.train_auc||0).toFixed(3)} · test ${(v3meta.test_auc||0).toFixed(3)}.
+      Awaiting first accept-tagged signals + outcomes (tracker runs every 6h).
+    </div>`;
+  }
+}
+
 async function fetchHeartbeat() {
   try {
     const d = await (await fetch('/api/heartbeat')).json();
@@ -880,7 +972,7 @@ function toast(msg) {
 
 async function refreshAll() {
   $('last-refresh').textContent = 'refreshing…';
-  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat(), fetchChampion()]);
+  await Promise.all([fetchTrades(), fetchPortfolio(), fetchLog(), fetchHeartbeat(), fetchChampion(), fetchModels()]);
   $('last-refresh').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
@@ -910,6 +1002,7 @@ setInterval(fetchPortfolio, 60000);
 setInterval(fetchLog,       10000);
 setInterval(fetchHeartbeat, 15000);
 setInterval(fetchChampion,  60000);
+setInterval(fetchModels,    90000);
 </script>
 </body>
 </html>
